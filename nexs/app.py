@@ -17,7 +17,8 @@ from .llm import LLM
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("nexs")
 
-EDITABLE = {"name", "role", "enabled", "use_llm", "model", "effort", "every", "weight", "prompt", "top_n", "auto_reward"}
+EDITABLE = {"name", "role", "enabled", "use_llm", "model", "effort", "every", "weight", "prompt", "top_n", "auto_reward",
+            "horizon", "max_symbols"}
 RISK_KEYS = {"trading_enabled", "max_position_value", "max_total_exposure", "max_orders_per_hour", "daily_loss_limit",
              "min_confidence", "stop_loss_pct", "take_profit_pct", "allow_short"}
 

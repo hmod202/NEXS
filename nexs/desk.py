@@ -10,13 +10,14 @@ from typing import Literal
 from pydantic import BaseModel
 
 from .bus import Bus
+from . import fundamentals as fund
 from .config import agents_cfg, risk_cfg
 from .indicators import clamp, pct_change, rsi, sma
 from .llm import LLM
 
 log = logging.getLogger("nexs.desk")
 
-BUILTIN = {"ceo", "scanner", "technical", "news", "macro", "risk", "execution", "auditor"}
+BUILTIN = {"ceo", "scanner", "technical", "news", "macro", "fundamentals", "bull", "bear", "risk", "execution", "auditor"}
 SIGNAL_HORIZON_S = 300  # signals are graded on the price move over the next 5 minutes
 POSITIVE = ("beat", "upgrade", "launch", "record", "surge", "raises", "approval", "partnership")
 NEGATIVE = ("miss", "downgrade", "cut", "probe", "lawsuit", "recall", "plunge", "investigation", "layoff")
@@ -37,6 +38,25 @@ class MarketView(BaseModel):
     score: float
     confidence: float
     reason: str
+
+
+class Argument(BaseModel):
+    symbol: str
+    argument: str
+    strength: float  # 0 .. 1, how convincing the case is
+
+
+class ArgumentList(BaseModel):
+    arguments: list[Argument]
+
+
+class Lesson(BaseModel):
+    id: int
+    lesson: str
+
+
+class LessonList(BaseModel):
+    lessons: list[Lesson]
 
 
 class Decision(BaseModel):
@@ -63,6 +83,7 @@ class Desk:
         self.closes: dict[str, list[float]] = {}
         self.account = {"equity": 0.0, "daily_pnl": 0.0}
         self.wake = asyncio.Event()
+        self.debate: dict[str, dict] = {}
 
     # ---------- plumbing ----------
     def send(self, src: str, dst: str, kind: str, payload) -> None:
@@ -121,7 +142,8 @@ class Desk:
                 self.send("scanner", dst, "focus", {"symbols": focus})
 
         analysts = {"technical": self.technical(focus), "news": self.news(focus, cfg["agents"].get("news", {})),
-                    "macro": self.macro(proxies, cfg["agents"].get("macro", {}))}
+                    "macro": self.macro(proxies, cfg["agents"].get("macro", {})),
+                    "fundamentals": self.fundamentals(focus, cfg["agents"].get("fundamentals", {}))}
         for agent, a in cfg["agents"].items():
             if agent not in BUILTIN:
                 analysts[agent] = self.custom(focus, a)
@@ -138,12 +160,13 @@ class Desk:
             self.send(agent, "ceo", "signals", [s.model_dump() for s in sigs])
 
         if self._active(cfg, "auditor"):
-            board = await self._step("auditor", self.audit())
+            board = await self._step("auditor", self.audit(cfg["agents"]["auditor"]))
             if board:
                 self.send("auditor", "ceo", "leaderboard", board)
 
         if not self._active(cfg, "ceo"):
             return
+        await self.run_debate(focus, cfg)
         decisions = await self._step("ceo", self.ceo(focus, cfg))
         if not decisions:
             return
@@ -216,6 +239,66 @@ class Desk:
         anchor = proxies[0]
         return [Signal(symbol=anchor, score=clamp(view.score), confidence=clamp(view.confidence, 0, 1), reason=view.reason)]
 
+    async def fundamentals(self, focus: list[str], a: dict) -> list[Signal]:
+        got = await asyncio.wait_for(asyncio.gather(*(asyncio.to_thread(fund.fetch, s) for s in focus),
+                                                    return_exceptions=True), 30)
+        data = {s: d for s, d in zip(focus, got) if isinstance(d, dict) and d}
+        if not data:
+            return []
+        if a.get("use_llm") and self.llm.available and a.get("prompt"):
+            res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
+                                            json.dumps(data, ensure_ascii=False), SignalList)
+            if res:
+                return [Signal(symbol=x.symbol, score=clamp(x.score), confidence=clamp(x.confidence, 0, 1),
+                               reason=x.reason) for x in res.signals if x.symbol in data]
+        out = []
+        for s, d in data.items():
+            score, why = fund.rule_score(d)
+            if score:
+                out.append(Signal(symbol=s, score=round(clamp(score), 3), confidence=0.4, reason=why))
+        return out
+
+    async def run_debate(self, focus: list[str], cfg: dict) -> None:
+        """Bull and bear researchers argue the strongest candidates before the CEO decides (from TradingAgents)."""
+        self.debate = {}
+        A = cfg["agents"]
+        sides = [x for x in ("bull", "bear") if self._active(cfg, x) and A[x].get("use_llm") and A[x].get("prompt")]
+        if not sides or not self.llm.available:
+            return
+        weights = self._weights(cfg)
+        views = {s: [{"agent": ag, "weight": round(weights.get(ag, 1), 2), **x.model_dump(exclude={"symbol"})}
+                     for ag, v in self.last_signals.items() if ag not in ("bull", "bear")
+                     for x in v["signals"] if x.symbol == s]
+                 for s in focus if s in self.closes}
+        net = {s: sum(v["weight"] * v["score"] * v["confidence"] for v in vs) for s, vs in views.items()}
+        n = int(A["bull" if "bull" in sides else "bear"].get("max_symbols", 2))
+        cands = [s for s in sorted(net, key=lambda s: abs(net[s]), reverse=True)[:n] if net[s]]
+        if not cands:
+            return  # nobody has a view yet; nothing to argue about
+        positions = self.broker.positions()
+        brief = {s: {"price": round(self.closes[s][-1], 2), "rsi": round(rsi(self.closes[s])),
+                     **{f"chg_{m}m": round(pct_change(self.closes[s], m), 3) for m in (5, 30)},
+                     "position": positions.get(s), "analyst_signals": views[s]} for s in cands}
+
+        async def argue(side: str):
+            a = A[side]
+            return await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
+                                             json.dumps(brief, ensure_ascii=False), ArgumentList)
+
+        results = await asyncio.gather(*(self._step(side, argue(side)) for side in sides))
+        for side, res in zip(sides, results):
+            if not res:
+                continue
+            sign = 1 if side == "bull" else -1
+            args = [x for x in res.arguments if x.symbol in brief]
+            sigs = [Signal(symbol=x.symbol, score=sign * clamp(x.strength, 0, 1), confidence=clamp(x.strength, 0, 1),
+                           reason=x.argument[:300]) for x in args]
+            self.last_signals[side] = {"ts": time.time(), "signals": sigs}
+            self._record_signals(side, sigs)  # debaters are graded and rewarded like everyone else
+            for x in args:
+                self.debate.setdefault(x.symbol, {})[side] = {"argument": x.argument, "strength": x.strength}
+            self.send(side, "ceo", "debate", [x.model_dump() for x in args])
+
     async def custom(self, focus: list[str], a: dict) -> list[Signal]:
         """Agents added from the UI: a prompt plus price stats and headlines in, graded signals out."""
         if not (a.get("use_llm", True) and self.llm.available and a.get("prompt")):
@@ -248,6 +331,7 @@ class Desk:
             "account": self.account,
             "directives_from_owner": cfg.get("directives", []),
             "market": [s.model_dump() for s in self.last_signals.get("macro", {}).get("signals", [])],
+            "lessons_from_your_past_trades": self.lessons(),
             "symbols": {},
         }
         for s in focus:
@@ -259,10 +343,12 @@ class Desk:
                 "signals": [
                     {"agent": ag, "weight": round(weights.get(ag, 1), 2), "age_s": round(now - v["ts"]),
                      **x.model_dump(exclude={"symbol"})}
-                    for ag, v in self.last_signals.items() if ag != "macro"
+                    for ag, v in self.last_signals.items() if ag not in ("macro", "bull", "bear")
                     for x in v["signals"] if x.symbol == s
                 ],
             }
+            if s in self.debate:
+                report["symbols"][s]["debate"] = self.debate[s]
         if a.get("use_llm") and self.llm.available:
             res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "medium"), a["prompt"],
                                             json.dumps(report, ensure_ascii=False), DecisionList)
@@ -360,13 +446,14 @@ class Desk:
 
     # ---------- auditor: scoring & rewards ----------
     def _record_signals(self, agent: str, sigs: list[Signal]) -> None:
-        rows = [(time.time(), agent, s.symbol, s.score, s.confidence, self.closes[s.symbol][-1], SIGNAL_HORIZON_S)
+        horizon = agents_cfg.get()["agents"].get(agent, {}).get("horizon", SIGNAL_HORIZON_S)
+        rows = [(time.time(), agent, s.symbol, s.score, s.confidence, self.closes[s.symbol][-1], horizon, s.reason)
                 for s in sigs if s.symbol in self.closes and s.score]
         self.bus.db.executemany(
-            "INSERT INTO signals(ts,agent,symbol,score,confidence,price,horizon) VALUES(?,?,?,?,?,?,?)", rows)
+            "INSERT INTO signals(ts,agent,symbol,score,confidence,price,horizon,reason) VALUES(?,?,?,?,?,?,?,?)", rows)
         self.bus.db.commit()
 
-    async def audit(self) -> list[dict]:
+    async def audit(self, a: dict | None = None) -> list[dict]:
         db, now = self.bus.db, time.time()
         due = db.execute("SELECT id,symbol,score,confidence,price FROM signals WHERE outcome IS NULL AND ts+horizon<=?",
                          (now,)).fetchall()
@@ -376,7 +463,37 @@ class Desk:
                 ret = (cur[-1] / px - 1) * 100
                 db.execute("UPDATE signals SET outcome=? WHERE id=?", (math.copysign(1, score) * ret * conf, sid))
         db.commit()
+        await self.reflect(a or {})
         return self.leaderboard()
+
+    async def reflect(self, a: dict) -> None:
+        """Turn each graded CEO decision into a short lesson the CEO reads next time (TradingAgents' reflection)."""
+        db = self.bus.db
+        rows = db.execute("""SELECT id,symbol,score,confidence,outcome,reason,horizon FROM signals
+                             WHERE agent='ceo' AND outcome IS NOT NULL AND lesson IS NULL ORDER BY id LIMIT 5""").fetchall()
+        if not rows:
+            return
+        trades = [{"id": i, "symbol": sym, "action": "buy" if sc > 0 else "sell", "confidence": c,
+                   "move_pct": round(o / (math.copysign(1, sc) * c), 3), "minutes": round(h / 60), "reason": r}
+                  for i, sym, sc, c, o, r, h in rows]
+        lessons = {}
+        if a.get("use_llm") and self.llm.available and a.get("prompt"):
+            res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
+                                            json.dumps(trades, ensure_ascii=False), LessonList)
+            lessons = {x.id: x.lesson for x in res.lessons} if res else {}
+        for t in trades:
+            right = (t["move_pct"] > 0) == (t["action"] == "buy")
+            text = lessons.get(t["id"]) or (
+                f"{t['action']} {t['symbol']} ({t['reason']}) → {t['move_pct']:+.2f}% in {t['minutes']}m: "
+                + ("correct call." if right else "wrong call; weigh these signals less next time."))
+            db.execute("UPDATE signals SET lesson=? WHERE id=?", (text, t["id"]))
+        db.commit()
+        self.send("auditor", "ceo", "lessons", [db.execute("SELECT lesson FROM signals WHERE id=?", (t["id"],)).fetchone()[0]
+                                               for t in trades])
+
+    def lessons(self, n: int = 6) -> list[str]:
+        return [r[0] for r in self.bus.db.execute(
+            "SELECT lesson FROM signals WHERE agent='ceo' AND lesson IS NOT NULL ORDER BY id DESC LIMIT ?", (n,))]
 
     def leaderboard(self) -> list[dict]:
         rows = self.bus.db.execute(

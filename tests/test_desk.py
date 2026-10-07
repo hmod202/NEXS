@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 
@@ -158,3 +159,97 @@ def test_ibkr_refuses_live_account_orders_without_explicit_opt_in(monkeypatch):
     monkeypatch.delenv("NEXS_ALLOW_LIVE", raising=False)
     with pytest.raises(RuntimeError, match="NEXS_ALLOW_LIVE"):
         run(b.bracket("AAPL", "buy", 1, 100, 99, 102))
+
+
+# ---------- ideas adopted from TradingAgents ----------
+class StubLLM(NoLLM):
+    """Answers by schema, records what each agent was asked."""
+
+    def __init__(self, answers):
+        super().__init__()
+        self.available, self.answers, self.calls = True, answers, []
+
+    async def structured(self, model, effort, system, user, schema):
+        self.calls.append((schema.__name__, system, user))
+        ans = self.answers.get(schema.__name__)
+        return ans(system, user) if callable(ans) else ans
+
+
+def test_bull_bear_debate_reaches_ceo_and_is_graded(tmp_path):
+    from nexs.config import agents_cfg
+    from nexs.desk import Argument, ArgumentList
+
+    desk, _ = make_desk(tmp_path)
+    desk.llm = StubLLM({"ArgumentList": lambda system, user: ArgumentList(arguments=[
+        Argument(symbol="AAPL", argument="متفائل" if "المحلل المتفائل" in system else "متشائم", strength=0.8)])})
+    desk.last_signals["technical"] = {"ts": time.time(), "signals": [Signal(symbol="AAPL", score=0.7, confidence=0.9, reason="up")]}
+    run(desk.run_debate(["AAPL"], agents_cfg.get()))
+    assert desk.debate["AAPL"]["bull"]["argument"] == "متفائل" and desk.debate["AAPL"]["bear"]["argument"] == "متشائم"
+    scores = dict(desk.bus.db.execute("SELECT agent, score FROM signals").fetchall())
+    assert scores == {"bull": 0.8, "bear": -0.8}
+    assert {m["kind"] for m in desk.bus.recent()} == {"debate"}
+
+
+def test_debate_skipped_when_no_analyst_has_a_view(tmp_path):
+    from nexs.config import agents_cfg
+
+    desk, _ = make_desk(tmp_path)
+    desk.llm = StubLLM({})
+    run(desk.run_debate(["AAPL"], agents_cfg.get()))
+    assert desk.llm.calls == [] and desk.debate == {}
+
+
+def test_graded_ceo_trades_become_lessons_for_the_ceo(tmp_path):
+    desk, _ = make_desk(tmp_path)
+    desk.closes["AAPL"] = [100.0]
+    desk._record_signals("ceo", [Signal(symbol="AAPL", score=1, confidence=0.8, reason="breakout")])
+    desk.bus.db.execute("UPDATE signals SET ts=?", (time.time() - 1000,))
+    desk.closes["AAPL"] = [99.0]
+    run(desk.audit({"use_llm": False}))
+    [lesson] = desk.lessons()
+    assert "breakout" in lesson and "-1.00%" in lesson and "wrong call" in lesson
+    from nexs.config import agents_cfg
+    from nexs.desk import DecisionList
+
+    desk.llm = StubLLM({"DecisionList": DecisionList(decisions=[], summary="")})
+    run(desk.ceo(["AAPL"], agents_cfg.get()))
+    [(_, _, user)] = desk.llm.calls
+    assert json.loads(user)["lessons_from_your_past_trades"] == [lesson]
+
+
+def test_reflection_uses_claude_when_available(tmp_path):
+    from nexs.desk import Lesson, LessonList
+
+    desk, _ = make_desk(tmp_path)
+    desk.closes["AAPL"] = [100.0]
+    desk._record_signals("ceo", [Signal(symbol="AAPL", score=1, confidence=1, reason="x")])
+    desk.bus.db.execute("UPDATE signals SET ts=?", (time.time() - 1000,))
+    desk.closes["AAPL"] = [102.0]
+    sid = desk.bus.db.execute("SELECT id FROM signals").fetchone()[0]
+    desk.llm = StubLLM({"LessonList": LessonList(lessons=[Lesson(id=sid, lesson="قرار صحيح")])})
+    run(desk.audit({"use_llm": True, "prompt": "p"}))
+    assert desk.lessons() == ["قرار صحيح"]
+
+
+def test_fundamentals_rules_and_per_agent_horizon(tmp_path, monkeypatch):
+    from nexs import fundamentals as fund
+    from nexs.config import agents_cfg
+
+    monkeypatch.setattr(fund, "fetch", lambda s: {"recommendationMean": 1.8, "targetMeanPrice": 120, "currentPrice": 100})
+    desk, _ = make_desk(tmp_path)
+    [sig] = run(desk.fundamentals(["AAPL"], {"use_llm": False}))
+    assert sig.score > 0.5 and "target upside +20%" in sig.reason
+    desk._record_signals("fundamentals", [sig])
+    horizon = desk.bus.db.execute("SELECT horizon FROM signals").fetchone()[0]
+    assert horizon == agents_cfg.get()["agents"]["fundamentals"]["horizon"] == 86400
+
+
+def test_fundamentals_survives_data_outage(tmp_path, monkeypatch):
+    from nexs import fundamentals as fund
+
+    def boom(s):
+        raise ConnectionError("yahoo down")
+
+    monkeypatch.setattr(fund, "fetch", boom)
+    desk, _ = make_desk(tmp_path)
+    assert run(desk.fundamentals(["AAPL"], {"use_llm": False})) == []

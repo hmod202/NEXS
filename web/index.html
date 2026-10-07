@@ -46,6 +46,7 @@
   .node { cursor: pointer; }
   .node rect { fill: var(--bg); stroke: var(--teal); stroke-width: 1.5; rx: 10; }
   .node.ceo rect { stroke: var(--brass); stroke-width: 2.5; }
+  .node.bull rect { stroke: var(--up); } .node.bear rect { stroke: var(--down); }
   .node.owner rect { stroke: var(--owner); stroke-dasharray: 4 3; }
   .node.running rect { fill: #2b3b4b; }
   .node.error rect { stroke: var(--down); }
@@ -62,6 +63,7 @@
   #feed { height: 520px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
   .msg { border-inline-start: 3px solid var(--teal); padding: 4px 10px; background: var(--bg); border-radius: var(--r-sm); }
   .msg.from-ceo { border-color: var(--brass); } .msg.from-owner { border-color: var(--owner); }
+  .msg.from-bull { border-color: var(--up); } .msg.from-bear { border-color: var(--down); }
   .msg.k-rejected, .msg.k-error, .msg.k-halt { border-color: var(--down); }
   .msg header { all: unset; display: flex; gap: 8px; font-size: 13px; color: var(--muted); }
   .msg .who { color: var(--text); font-weight: 500; }
@@ -214,9 +216,10 @@ function api(path, method = "GET", body) {
 
 /* ---------- org chart ---------- */
 function computeLayout(agents) {
-  const analysts = Object.keys(agents).filter(id => !["ceo", "risk", "execution", "auditor"].includes(id));
+  const analysts = Object.keys(agents).filter(id => !["ceo", "bull", "bear", "risk", "execution", "auditor"].includes(id));
   // risk → execution → auditor reads right-to-left; a central spine at x=400 links them to the CEO
-  const L = { ceo: { x: 400, y: 60 }, owner: { x: 720, y: 60 }, risk: { x: 580, y: 400 }, execution: { x: 400, y: 400 }, auditor: { x: 220, y: 400 } };
+  const L = { ceo: { x: 400, y: 60 }, owner: { x: 720, y: 60 }, risk: { x: 580, y: 400 }, execution: { x: 400, y: 400 }, auditor: { x: 220, y: 400 },
+             bull: { x: 175, y: 30 }, bear: { x: 175, y: 95 } };  // the debate pair sits beside the CEO
   const slots = analysts.length + (analysts.length % 2);  // even slot count keeps the spine between boxes
   const step = slots > 1 ? 640 / (slots - 1) : 0;
   analysts.forEach((id, i) => { L[id] = { x: slots > 1 ? 720 - step * i : 400, y: 230, w: Math.min(128, step - 20 || 128) }; });
@@ -237,7 +240,7 @@ function drawChart() {
   layout = computeLayout(agents);
   const edges = $("#edges"), nodes = $("#nodes");
   edges.replaceChildren(); nodes.replaceChildren();
-  const links = [["owner", "ceo"], ["ceo", "risk"], ["risk", "execution"], ["execution", "auditor"], ["auditor", "ceo"]];
+  const links = [["owner", "ceo"], ["bull", "ceo"], ["bear", "ceo"], ["ceo", "risk"], ["risk", "execution"], ["execution", "auditor"], ["auditor", "ceo"]];
   Object.keys(agents).forEach(id => { if (layout[id].y === 230) links.push(["ceo", id]); });
   for (const [a, b] of links) {
     if (!layout[a] || !layout[b]) continue;
@@ -307,6 +310,8 @@ function describe(m) {
     case "fills": return p.map(f => `${AR[f.action]} ${f.symbol}: ${f.status}`).join("\n");
     case "leaderboard": return p.slice(0, 4).map(r => `${name(r.agent)}: ${fmt(r.points)} نقطة (إصابة ${Math.round(r.hit_rate * 100)}٪)`).join("\n") || "لا توجد إشارات مُقيّمة بعد";
     case "directive": return "توجيه: " + p.text;
+    case "debate": return p.map(a => `${a.symbol} (قوة ${fmt(a.strength)}): ${a.argument}`).join("\n");
+    case "lessons": return "دروس من صفقات سابقة:\n" + p.join("\n");
     case "halt": return "⛔ توقف التداول: " + p.reason;
     case "resume": return "استُؤنف التداول";
     case "hire": return "انضم وكيل جديد: " + p.name;

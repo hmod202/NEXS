@@ -20,11 +20,16 @@ class Bus:
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, ts REAL, cycle INT,
                 src TEXT, dst TEXT, kind TEXT, payload TEXT);
             CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY, ts REAL, agent TEXT, symbol TEXT,
-                score REAL, confidence REAL, price REAL, horizon REAL, outcome REAL);
+                score REAL, confidence REAL, price REAL, horizon REAL, outcome REAL, reason TEXT, lesson TEXT);
             CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, ts REAL, symbol TEXT, side TEXT,
                 qty REAL, price REAL, status TEXT, note TEXT);
             """
         )
+        for col in ("reason", "lesson"):  # databases created before these columns existed
+            try:
+                self.db.execute(f"ALTER TABLE signals ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
         self.subscribers: set[asyncio.Queue] = set()
 
     def publish(self, cycle: int, src: str, dst: str, kind: str, payload) -> dict:

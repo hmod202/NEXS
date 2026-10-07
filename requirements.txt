@@ -4,3 +4,4 @@ anthropic>=1.11
 ib_async>=2.1
 pyyaml
 pydantic>=2
+yfinance
