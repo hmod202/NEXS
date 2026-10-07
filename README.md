@@ -30,7 +30,7 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env      # ضع ANTHROPIC_API_KEY
-./run.sh                  # يعيد التشغيل تلقائياً إذا توقف
+./run.sh                  # يعيد التشغيل تلقائياً إذا توقف (على ويندوز: run.bat)
 ```
 
 افتح http://127.0.0.1:8000

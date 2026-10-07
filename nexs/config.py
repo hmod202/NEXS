@@ -5,6 +5,15 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Load .env (KEY=VALUE lines) so the same setup works on Windows without a shell; real env vars win.
+if (ROOT / ".env").exists():
+    for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+        key, sep, value = line.partition("=")
+        value = value.split(" #")[0].strip()
+        if sep and value and not key.strip().startswith("#"):
+            os.environ.setdefault(key.strip(), value)
+
 CONFIG_DIR = Path(os.environ.get("NEXS_CONFIG_DIR", ROOT / "config"))
 
 
