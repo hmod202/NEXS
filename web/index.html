@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEXS — غرفة التداول</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%23d4a84b%27/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #1b2430; --panel: #222d3b; --line: #34414f; --text: #e6e9ee; --muted: #93a0b0;
+    --brass: #d4a84b; --teal: #6fb3b8; --up: #4cb782; --down: #e0605e; --owner: #b58ad6;
+    --r-sm: 4px; --r-md: 8px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 "IBM Plex Sans Arabic", system-ui, sans-serif; }
+  .num { font-variant-numeric: tabular-nums; direction: ltr; unicode-bidi: isolate; }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: var(--r-sm); padding: 6px 12px; }
+  button:hover { border-color: var(--muted); }
+  :focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+  input, textarea, select { background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px 8px; width: 100%; }
+
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 24px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: .02em; }
+  .stat { display: flex; flex-direction: column; }
+  .stat small { color: var(--muted); font-size: 12px; }
+  .stat b { font-weight: 500; }
+  .chip { padding: 2px 10px; border-radius: 999px; border: 1px solid currentColor; font-size: 13px; }
+  .chip.sim { color: var(--teal); } .chip.paper { color: var(--brass); } .chip.live { color: var(--down); }
+  .spacer { flex: 1; }
+  #halt { background: var(--down); border-color: var(--down); color: #fff; font-weight: 600; }
+  #halt.resume { background: var(--up); border-color: var(--up); }
+  .banner { padding: 8px 20px; background: #4a2a2a; color: #ffd9d6; display: none; }
+  .up { color: var(--up); } .down { color: var(--down); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); padding: 14px 16px; min-width: 0; }
+  section.panel h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; color: var(--muted); }
+
+  /* the org chart is the one loud element on the page */
+  #chart svg { width: 100%; height: auto; display: block; }
+  .edge { stroke: var(--line); stroke-width: 1.5; }
+  .node { cursor: pointer; }
+  .node rect { fill: var(--bg); stroke: var(--teal); stroke-width: 1.5; rx: 10; }
+  .node.ceo rect { stroke: var(--brass); stroke-width: 2.5; }
+  .node.owner rect { stroke: var(--owner); stroke-dasharray: 4 3; }
+  .node.running rect { fill: #2b3b4b; }
+  .node.error rect { stroke: var(--down); }
+  .node.disabled { opacity: .35; }
+  .node text { fill: var(--text); font-size: 14px; text-anchor: middle; }
+  .node .sub { fill: var(--muted); font-size: 11px; }
+  .pulse { r: 6; }
+  .directive { display: flex; gap: 8px; margin-top: 12px; }
+  .directive input { flex: 1; }
+  #directives { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  #directives li { background: var(--bg); border: 1px solid var(--owner); border-radius: var(--r-sm); padding: 2px 8px; font-size: 13px; }
+  #directives button { border: 0; background: none; padding: 0 4px; color: var(--muted); }
+
+  #feed { height: 520px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .msg { border-inline-start: 3px solid var(--teal); padding: 4px 10px; background: var(--bg); border-radius: var(--r-sm); }
+  .msg.from-ceo { border-color: var(--brass); } .msg.from-owner { border-color: var(--owner); }
+  .msg.k-rejected, .msg.k-error, .msg.k-halt { border-color: var(--down); }
+  .msg header { all: unset; display: flex; gap: 8px; font-size: 13px; color: var(--muted); }
+  .msg .who { color: var(--text); font-weight: 500; }
+  .msg .body { font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .msg pre { margin: 4px 0 0; font-size: 12px; max-height: 240px; overflow: auto; direction: ltr; text-align: left; }
+
+  .tabs { grid-column: 1 / -1; }
+  .tabbar { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; flex-wrap: wrap; }
+  .tabbar button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); }
+  .tabbar button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--brass); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: start; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  .table-wrap { overflow-x: auto; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  .form-grid label.check { flex-direction: row; align-items: center; gap: 8px; }
+  .form-grid input[type=checkbox] { width: auto; }
+  .actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
+  .saved { color: var(--up); font-size: 13px; }
+
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--r-md); width: min(640px, calc(100vw - 32px)); padding: 18px; }
+  dialog::backdrop { background: rgba(0,0,0,.5); }
+  dialog h3 { margin: 0 0 4px; }
+  dialog p { margin: 0 0 12px; color: var(--muted); }
+  dialog textarea { min-height: 180px; }
+  @media (prefers-reduced-motion: reduce) { .pulse { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>NEXS</h1>
+  <span id="mode" class="chip sim">محاكاة</span>
+  <div class="stat"><small>قيمة الحساب</small><b id="equity" class="num">—</b></div>
+  <div class="stat"><small>ربح/خسارة اليوم</small><b id="pnl" class="num">—</b></div>
+  <div class="stat"><small>الدورة</small><b id="cycle" class="num">0</b></div>
+  <div class="stat"><small>Claude</small><b id="llm">—</b></div>
+  <div class="spacer"></div>
+  <button id="runnow" type="button">شغّل دورة الآن</button>
+  <button id="halt" type="button">إيقاف التداول</button>
+</header>
+<div class="banner" id="banner"></div>
+
+<main>
+  <section class="panel" id="chart">
+    <h2>الفريق — اضغط على أي وكيل لتعديله</h2>
+    <svg id="svg" viewBox="0 0 800 470" role="img" aria-label="مخطط الوكلاء والرسائل بينهم">
+      <g id="edges"></g><g id="nodes"></g><g id="pulses"></g>
+    </svg>
+    <form class="directive" id="directiveForm">
+      <input id="directiveText" placeholder="أرسل توجيهاً للمدير التنفيذي، مثل: لا تفتح صفقات على TSLA اليوم" aria-label="توجيه للمدير التنفيذي">
+      <button type="submit">أرسل</button>
+    </form>
+    <ul id="directives"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>المحادثات بين الوكلاء</h2>
+    <div id="feed" aria-live="polite"></div>
+  </section>
+
+  <section class="panel tabs">
+    <div class="tabbar" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="board">الترتيب والمكافآت</button>
+      <button role="tab" aria-selected="false" data-tab="positions">المراكز والصفقات</button>
+      <button role="tab" aria-selected="false" data-tab="risk">حدود المخاطر</button>
+      <button role="tab" aria-selected="false" data-tab="settings">الإعدادات والوكلاء</button>
+    </div>
+    <div data-panel="board">
+      <div class="table-wrap"><table>
+        <thead><tr><th>الوكيل</th><th>إشارات مُقيّمة</th><th>نسبة الإصابة</th><th>النقاط</th><th>مكافأة الثقة</th></tr></thead>
+        <tbody id="board"></tbody>
+      </table></div>
+      <p style="color:var(--muted);font-size:13px">كل إشارة تُقيَّم بعد ٥ دقائق: إن تحرك السعر في اتجاهها كسب الوكيل نقاطاً. الوكيل صاحب الأداء الأفضل يحصل على وزن أعلى عند المدير التنفيذي (حتى ×٢)، والأسوأ ينخفض وزنه (حتى ×٠٫٢٥).</p>
+    </div>
+    <div data-panel="positions" hidden>
+      <div class="table-wrap"><table>
+        <thead><tr><th>السهم</th><th>الكمية</th><th>متوسط السعر</th><th>السعر الحالي</th><th>ربح/خسارة</th></tr></thead>
+        <tbody id="positions"></tbody>
+      </table></div>
+      <h2 style="margin-top:16px">آخر الصفقات</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>الوقت</th><th>السهم</th><th>النوع</th><th>الكمية</th><th>السعر</th><th>الحالة</th></tr></thead>
+        <tbody id="trades"></tbody>
+      </table></div>
+    </div>
+    <div data-panel="risk" hidden>
+      <form id="riskForm" class="form-grid"></form>
+      <div class="actions"><button type="submit" form="riskForm">احفظ الحدود</button><span class="saved" id="riskSaved"></span></div>
+    </div>
+    <div data-panel="settings" hidden>
+      <form id="settingsForm" class="form-grid">
+        <label>الأسهم المراقبة (افصل بفاصلة)<input name="watchlist"></label>
+        <label>مدة الدورة بالثواني<input name="cycle_seconds" type="number" min="5"></label>
+      </form>
+      <div class="actions"><button type="submit" form="settingsForm">احفظ الإعدادات</button><span class="saved" id="settingsSaved"></span></div>
+      <h2 style="margin-top:20px">وظّف وكيلاً جديداً</h2>
+      <form id="hireForm" class="form-grid">
+        <label>المعرّف (إنجليزي)<input name="id" placeholder="earnings" required pattern="[a-z0-9_]+"></label>
+        <label>الاسم<input name="name" placeholder="محلل الأرباح" required></label>
+        <label>يعمل كل كم دورة<input name="every" type="number" min="1" value="2"></label>
+        <label style="grid-column:1/-1">التعليمات (ماذا يحلل وكيف)<textarea name="prompt" required placeholder="أنت محلل متخصص في ... قيّم كل سهم من حيث ..."></textarea></label>
+      </form>
+      <div class="actions"><button type="submit" form="hireForm">وظّف الوكيل</button><span class="saved" id="hireSaved"></span></div>
+    </div>
+  </section>
+</main>
+
+<dialog id="editor">
+  <form method="dialog" id="agentForm">
+    <h3 id="edTitle"></h3>
+    <p id="edRole"></p>
+    <div class="form-grid">
+      <label class="check"><input type="checkbox" name="enabled"> يعمل</label>
+      <label class="check"><input type="checkbox" name="use_llm"> يستخدم Claude</label>
+      <label>النموذج<select name="model">
+        <option value="claude-opus-5-5">Claude Opus 5.5</option>
+        <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+        <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+      </select></label>
+      <label>عمق التفكير<select name="effort">
+        <option value="low">منخفض (أسرع وأوفر)</option><option value="medium">متوسط</option><option value="high">عالٍ</option>
+      </select></label>
+      <label>يعمل كل كم دورة<input type="number" name="every" min="1"></label>
+      <label>الوزن اليدوي<input type="number" name="weight" min="0" max="3" step="0.1"></label>
+      <label style="grid-column:1/-1">التعليمات<textarea name="prompt"></textarea></label>
+    </div>
+    <div class="actions">
+      <button value="save" id="edSave">احفظ — يسري من الدورة القادمة</button>
+      <button value="cancel" formnovalidate>إلغاء</button>
+      <span class="spacer"></span>
+      <button value="fire" id="edFire" style="color:var(--down)">احذف الوكيل</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+let S = null;           // latest state
+let layout = {};        // agent id -> {x, y}
+const fmt = (n, d = 2) => n == null || isNaN(n) ? "—" : Number(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const name = id => id === "owner" ? "أنت" : (S?.agents?.[id]?.name || id);
+
+function api(path, method = "GET", body) {
+  return fetch(path + location.search, { method, headers: { "content-type": "application/json" }, body: body && JSON.stringify(body) })
+    .then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e.detail || r.statusText)));
+}
+
+/* ---------- org chart ---------- */
+function computeLayout(agents) {
+  const analysts = Object.keys(agents).filter(id => !["ceo", "risk", "execution", "auditor"].includes(id));
+  // risk → execution → auditor reads right-to-left; a central spine at x=400 links them to the CEO
+  const L = { ceo: { x: 400, y: 60 }, owner: { x: 720, y: 60 }, risk: { x: 580, y: 400 }, execution: { x: 400, y: 400 }, auditor: { x: 220, y: 400 } };
+  const slots = analysts.length + (analysts.length % 2);  // even slot count keeps the spine between boxes
+  const step = slots > 1 ? 640 / (slots - 1) : 0;
+  analysts.forEach((id, i) => { L[id] = { x: slots > 1 ? 720 - step * i : 400, y: 230, w: Math.min(128, step - 20 || 128) }; });
+  return L;
+}
+
+// Org-chart elbows: CEO fans out above the analysts; the spine runs below them to risk/execution/auditor.
+function route(a, b) {
+  const A = layout[a], B = layout[b];
+  if (A.y === B.y) return [A, B];
+  if (a === "ceo" && B.y === 230) return [A, { x: A.x, y: 145 }, { x: B.x, y: 145 }, B];
+  if (B.y === 400 || A.y === 400) { const [top, bot] = A.y < B.y ? [A, B] : [B, A]; const pts = [top, { x: 400, y: 320 }, { x: bot.x, y: 320 }, bot]; return A.y < B.y ? pts : pts.reverse(); }
+  return [A, B];
+}
+
+function drawChart() {
+  const agents = S.agents;
+  layout = computeLayout(agents);
+  const edges = $("#edges"), nodes = $("#nodes");
+  edges.replaceChildren(); nodes.replaceChildren();
+  const links = [["owner", "ceo"], ["ceo", "risk"], ["risk", "execution"], ["execution", "auditor"], ["auditor", "ceo"]];
+  Object.keys(agents).forEach(id => { if (layout[id].y === 230) links.push(["ceo", id]); });
+  for (const [a, b] of links) {
+    if (!layout[a] || !layout[b]) continue;
+    const l = document.createElementNS(NS, "polyline");
+    l.setAttribute("points", route(a, b).map(p => `${p.x},${p.y}`).join(" "));
+    l.setAttribute("class", "edge"); l.setAttribute("fill", "none");
+    edges.append(l);
+  }
+  for (const id of ["owner", ...Object.keys(agents)]) {
+    const a = agents[id] || { name: "أنت", role: "توجيهات المالك" };
+    const { x, y } = layout[id];
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", `node ${id} ${a.enabled === false ? "disabled" : (a.status || "")}`);
+    g.setAttribute("transform", `translate(${x},${y})`);
+    g.setAttribute("tabindex", "0");
+    g.dataset.id = id;
+    const w = id === "ceo" ? 170 : (layout[id].w || 128);
+    const r = document.createElementNS(NS, "rect");
+    Object.entries({ x: -w / 2, y: -26, width: w, height: 52 }).forEach(([k, v]) => r.setAttribute(k, v));
+    const t = document.createElementNS(NS, "text"); t.setAttribute("y", -3); t.textContent = a.name;
+    const sub = document.createElementNS(NS, "text"); sub.setAttribute("y", 15); sub.setAttribute("class", "sub");
+    sub.textContent = id === "owner" ? "توجيهات" : nodeSub(a);
+    g.append(r, t, sub);
+    if (id !== "owner") {
+      g.addEventListener("click", () => openEditor(id));
+      g.addEventListener("keydown", e => { if (e.key === "Enter") openEditor(id); });
+    }
+    nodes.append(g);
+  }
+}
+
+function nodeSub(a) {
+  const brain = a.use_llm ? (S.llm.available ? "Claude" : "قواعد (لا يوجد مفتاح)") : "قواعد";
+  const reward = a.reward_x && a.reward_x !== 1 ? ` · ×${a.reward_x}` : "";
+  return a.status === "running" ? "يعمل الآن…" : brain + reward;
+}
+
+function updateNodes() {
+  for (const g of $("#nodes").children) {
+    const a = S.agents[g.dataset.id]; if (!a) continue;
+    g.setAttribute("class", `node ${g.dataset.id} ${a.enabled === false ? "disabled" : (a.status || "")}`);
+    g.querySelector(".sub").textContent = nodeSub(a);
+  }
+}
+
+function pulse(src, dst) {
+  const a = layout[src], b = layout[dst];
+  if (!a || !b || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const c = document.createElementNS(NS, "circle");
+  c.setAttribute("class", "pulse"); c.setAttribute("r", 6);
+  c.setAttribute("fill", src === "ceo" ? "var(--brass)" : src === "owner" ? "var(--owner)" : "var(--teal)");
+  $("#pulses").append(c);
+  c.animate(route(src, dst).map(p => ({ transform: `translate(${p.x}px,${p.y}px)` })),
+    { duration: 1000, easing: "ease-in-out" }).onfinish = () => c.remove();
+}
+
+/* ---------- message feed ---------- */
+const AR = { buy: "شراء", sell: "بيع", hold: "انتظار", close: "إغلاق" };
+function describe(m) {
+  const p = m.payload;
+  switch (m.kind) {
+    case "focus": return "ركّز على: " + p.symbols.join("، ");
+    case "signals": return p.length ? p.map(s => `${s.symbol} ${s.score > 0 ? "▲" : s.score < 0 ? "▼" : "•"}${fmt(s.score)} (ثقة ${fmt(s.confidence)}) — ${s.reason}`).join("\n") : "لا جديد";
+    case "decisions": return p.summary + "\n" + p.decisions.filter(d => d.action !== "hold").map(d => `${AR[d.action]} ${d.symbol} — ${d.reason}`).join("\n");
+    case "approved": return p.map(o => `${AR[o.action]} ${o.qty} ${o.symbol} @ ${fmt(o.price)}` + (o.stop ? ` · وقف ${fmt(o.stop)} · هدف ${fmt(o.take)}` : "")).join("\n");
+    case "rejected": return p.map(o => `رُفض ${AR[o.action]} ${o.symbol}: ${o.reason}`).join("\n");
+    case "fills": return p.map(f => `${AR[f.action]} ${f.symbol}: ${f.status}`).join("\n");
+    case "leaderboard": return p.slice(0, 4).map(r => `${name(r.agent)}: ${fmt(r.points)} نقطة (إصابة ${Math.round(r.hit_rate * 100)}٪)`).join("\n") || "لا توجد إشارات مُقيّمة بعد";
+    case "directive": return "توجيه: " + p.text;
+    case "halt": return "⛔ توقف التداول: " + p.reason;
+    case "resume": return "استُؤنف التداول";
+    case "hire": return "انضم وكيل جديد: " + p.name;
+    case "flatten": return "إغلاق كل المراكز";
+    case "error": return "خطأ: " + p.error;
+    default: return JSON.stringify(p);
+  }
+}
+
+function addMsg(m, animate = true) {
+  const el = document.createElement("article");
+  el.className = `msg from-${m.src} k-${m.kind}`;
+  const h = document.createElement("header");
+  const who = document.createElement("span"); who.className = "who"; who.textContent = `${name(m.src)} ← ${name(m.dst)}`;
+  const t = document.createElement("span"); t.className = "num"; t.textContent = new Date(m.ts * 1000).toLocaleTimeString("en-GB");
+  h.append(who, t);
+  const body = document.createElement("div"); body.className = "body"; body.textContent = describe(m);
+  const d = document.createElement("details"); const s = document.createElement("summary"); s.textContent = "البيانات";
+  const pre = document.createElement("pre"); pre.textContent = JSON.stringify(m.payload, null, 2); d.append(s, pre);
+  el.append(h, body, d);
+  const feed = $("#feed");
+  const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
+  feed.append(el);
+  while (feed.children.length > 300) feed.firstChild.remove();
+  if (atBottom) feed.scrollTop = feed.scrollHeight;
+  if (animate) pulse(m.src, m.dst);
+}
+
+/* ---------- state rendering ---------- */
+function render() {
+  const modes = { sim: "محاكاة", paper: "IBKR تجريبي", live: "IBKR حقيقي" };
+  const mode = $("#mode"); mode.textContent = modes[S.mode] || S.mode; mode.className = `chip ${S.mode}`;
+  $("#equity").textContent = "$" + fmt(S.account.equity);
+  const pnl = S.account.daily_pnl; $("#pnl").textContent = (pnl >= 0 ? "+" : "") + fmt(pnl); $("#pnl").className = "num " + (pnl >= 0 ? "up" : "down");
+  $("#cycle").textContent = S.cycle;
+  const u = S.llm.usage;
+  $("#llm").textContent = S.llm.available ? `${S.llm.status} · ${u.calls} طلب` : "غير متصل";
+  $("#llm").title = `input ${u.input} · cached ${u.cache_read} · output ${u.output} tokens`;
+  const halt = $("#halt");
+  halt.textContent = S.halted ? "استئناف التداول" : "إيقاف التداول"; halt.classList.toggle("resume", S.halted);
+  const banner = $("#banner");
+  const warn = [S.broker_error, S.halted && `التداول متوقف: ${S.halt_reason}`, !S.risk.trading_enabled && "إرسال الأوامر معطّل من حدود المخاطر — الوكلاء يحللون فقط"].filter(Boolean);
+  banner.style.display = warn.length ? "block" : "none"; banner.textContent = warn.join(" · ");
+
+  if (Object.keys(S.agents).sort().join() !== Object.keys(layout).filter(k => k !== "owner").sort().join()) drawChart(); else updateNodes();
+
+  $("#board").replaceChildren(...(S.leaderboard.length ? S.leaderboard.map(r => row([name(r.agent), r.graded, Math.round(r.hit_rate * 100) + "٪", fmt(r.points), "×" + r.reward_x], [3]))
+    : [emptyRow(5, "لم تُقيَّم أي إشارة بعد — يبدأ التقييم بعد ٥ دقائق من أول إشارة")]));
+  const pos = Object.entries(S.positions);
+  $("#positions").replaceChildren(...(pos.length ? [] : [emptyRow(5, "لا توجد مراكز مفتوحة")]), ...pos.map(([sym, p]) => {
+    const px = S.prices[sym]; const pl = px ? (px - p.avg) * p.qty : null;
+    const tr = row([sym, p.qty, fmt(p.avg), fmt(px), fmt(pl)]); tr.lastChild.className = "num " + (pl >= 0 ? "up" : "down"); return tr;
+  }));
+  $("#trades").replaceChildren(...S.trades.map(t => row([new Date(t.ts * 1000).toLocaleTimeString("en-GB"), t.symbol, AR[t.side] || t.side, t.qty, fmt(t.price), t.status])));
+  $("#directives").replaceChildren(...(S.settings.directives || []).map((d, i) => {
+    const li = document.createElement("li"); li.textContent = d;
+    const b = document.createElement("button"); b.type = "button"; b.textContent = "×"; b.setAttribute("aria-label", "احذف التوجيه");
+    b.onclick = () => api(`/api/directive/${i}`, "DELETE").then(refresh); li.append(b); return li;
+  }));
+  fillForms();
+}
+
+function emptyRow(span, text) {
+  const tr = document.createElement("tr"), td = document.createElement("td");
+  td.colSpan = span; td.textContent = text; td.style.color = "var(--muted)"; tr.append(td); return tr;
+}
+
+function row(cells, numericCols = []) {
+  const tr = document.createElement("tr");
+  cells.forEach((c, i) => { const td = document.createElement("td"); td.textContent = c ?? "—"; if (typeof c === "number" || numericCols.includes(i)) td.className = "num"; tr.append(td); });
+  return tr;
+}
+
+const RISK_LABELS = {
+  trading_enabled: "السماح بإرسال الأوامر", allow_short: "السماح بالبيع على المكشوف",
+  max_position_value: "أقصى قيمة لمركز واحد ($)", max_total_exposure: "أقصى مجموع للمراكز ($)",
+  max_orders_per_hour: "أقصى عدد أوامر بالساعة", daily_loss_limit: "حد الخسارة اليومية ($)",
+  min_confidence: "أقل ثقة مقبولة (0–1)", stop_loss_pct: "وقف الخسارة ٪", take_profit_pct: "جني الأرباح ٪",
+};
+let formsFilled = false;
+function fillForms() {
+  if (formsFilled) return; formsFilled = true;
+  const f = $("#riskForm");
+  f.replaceChildren(...Object.entries(RISK_LABELS).map(([k, label]) => {
+    const l = document.createElement("label"); const i = document.createElement("input"); i.name = k;
+    if (typeof S.risk[k] === "boolean") { i.type = "checkbox"; i.checked = S.risk[k]; l.className = "check"; l.append(i, label); }
+    else { i.type = "number"; i.step = "any"; i.value = S.risk[k]; l.append(label, i); }
+    return l;
+  }));
+  $("#settingsForm").watchlist.value = S.settings.watchlist.join(", ");
+  $("#settingsForm").cycle_seconds.value = S.settings.cycle_seconds;
+}
+
+function flash(id, text) { const el = $(id); el.textContent = text; setTimeout(() => el.textContent = "", 3000); }
+
+/* ---------- editor ---------- */
+function openEditor(id) {
+  const a = S.agents[id], f = $("#agentForm"), dlg = $("#editor");
+  $("#edTitle").textContent = a.name; $("#edRole").textContent = a.role || "";
+  f.enabled.checked = !!a.enabled; f.use_llm.checked = !!a.use_llm;
+  f.model.value = a.model || "claude-opus-5-5"; f.effort.value = a.effort || "low";
+  f.every.value = a.every || 1; f.weight.value = a.weight ?? 1; f.prompt.value = a.prompt || "";
+  const llmCapable = "prompt" in a;
+  for (const n of ["use_llm", "model", "effort", "prompt"]) f[n].closest("label").hidden = !llmCapable;
+  $("#edFire").hidden = a.builtin;
+  dlg.onclose = () => {
+    if (dlg.returnValue === "save") {
+      const patch = { enabled: f.enabled.checked, every: +f.every.value, weight: +f.weight.value };
+      if (llmCapable) Object.assign(patch, { use_llm: f.use_llm.checked, model: f.model.value, effort: f.effort.value, prompt: f.prompt.value });
+      api(`/api/agents/${id}`, "PUT", patch).then(refresh).catch(alert);
+    } else if (dlg.returnValue === "fire" && confirm(`حذف ${a.name}؟`)) {
+      api(`/api/agents/${id}`, "DELETE").then(refresh).catch(alert);
+    }
+  };
+  dlg.returnValue = ""; dlg.showModal();
+}
+
+/* ---------- wiring ---------- */
+function refresh() { return api("/api/state").then(s => { S = s; render(); }); }
+
+$("#halt").onclick = () => {
+  if (S.halted) return api("/api/resume", "POST").then(refresh);
+  const flatten = confirm("إيقاف التداول.\nهل تريد أيضاً إغلاق كل المراكز المفتوحة الآن؟\n(موافق = إغلاق الكل، إلغاء = إيقاف الأوامر الجديدة فقط)");
+  api("/api/halt", "POST", { flatten }).then(refresh);
+};
+$("#runnow").onclick = () => api("/api/cycle", "POST");
+$("#directiveForm").onsubmit = e => {
+  e.preventDefault(); const t = $("#directiveText");
+  if (t.value.trim()) api("/api/directive", "POST", { text: t.value }).then(() => { t.value = ""; refresh(); });
+};
+$("#riskForm").onsubmit = e => {
+  e.preventDefault();
+  const patch = {}; for (const i of e.target.elements) patch[i.name] = i.type === "checkbox" ? i.checked : +i.value;
+  api("/api/risk", "PUT", patch).then(() => { flash("#riskSaved", "تم الحفظ"); refresh(); }).catch(alert);
+};
+$("#settingsForm").onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  api("/api/settings", "PUT", { watchlist: f.watchlist.value.split(","), cycle_seconds: +f.cycle_seconds.value })
+    .then(() => { flash("#settingsSaved", "تم الحفظ"); refresh(); }).catch(alert);
+};
+$("#hireForm").onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  api("/api/agents", "POST", { id: f.id.value, name: f.name.value, every: +f.every.value, prompt: f.prompt.value })
+    .then(() => { f.reset(); flash("#hireSaved", "انضم للفريق"); refresh(); }).catch(alert);
+};
+document.querySelectorAll(".tabbar button").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tabbar button").forEach(x => x.setAttribute("aria-selected", x === b));
+  document.querySelectorAll("[data-panel]").forEach(p => p.hidden = p.dataset.panel !== b.dataset.tab);
+});
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws${location.search}`);
+  ws.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "hello") { S = ev.state; render(); $("#feed").replaceChildren(); ev.messages.forEach(m => addMsg(m, false)); }
+    else if (ev.type === "message") addMsg(ev);
+    else if (ev.type === "state") { S = ev; render(); }
+    else if (ev.type === "agent" && S?.agents[ev.id]) { Object.assign(S.agents[ev.id], ev); updateNodes(); }
+    else if (ev.type === "cycle" && S) { S.cycle = ev.cycle; $("#cycle").textContent = ev.cycle; }
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+connect();
+</script>
+</body>
+</html>

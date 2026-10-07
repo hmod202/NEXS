@@ -1,0 +1,94 @@
+# إعدادات الوكلاء — تُقرأ من جديد في كل دورة، فأي تعديل هنا أو من الواجهة يسري فوراً بدون إعادة تشغيل.
+# use_llm: false  => الوكيل يعمل بقواعد برمجية (سريع ومجاني)
+# weight          => ثقة المدير التنفيذي في الوكيل؛ يعدّلها المدقق تلقائياً حسب الأداء (نظام المكافآت)
+# every           => يعمل كل كم دورة
+
+cycle_seconds: 30
+watchlist: [AAPL, MSFT, NVDA, TSLA, AMZN, META]
+market_proxies: [SPY, QQQ]
+directives: []   # توجيهات منك للمدير التنفيذي، مثل "تجنّب TSLA اليوم"
+
+agents:
+  ceo:
+    name: المدير التنفيذي
+    role: يجمع تقارير الوكلاء ويقرر الصفقات
+    enabled: true
+    use_llm: true
+    model: claude-opus-5-5
+    effort: medium
+    every: 1
+    weight: 1.0
+    prompt: |
+      أنت المدير التنفيذي لفريق تداول قصير المدى. تصلك إشارات من محللين لكل منهم وزن ثقة.
+      قرّر لكل سهم: buy أو sell أو hold، مع الكمية والثقة والسبب باختصار.
+      كن متحفظاً: إذا تعارضت الإشارات أو كانت ضعيفة فاختر hold. لا تطارد السعر.
+      الأولوية لحماية رأس المال قبل الربح.
+
+  scanner:
+    name: الماسح
+    role: يرتّب الأسهم حسب الحركة والسيولة ويختار الأنشط
+    enabled: true
+    use_llm: false
+    every: 1
+    weight: 1.0
+    top_n: 4
+
+  technical:
+    name: المحلل الفني
+    role: RSI والمتوسطات والزخم
+    enabled: true
+    use_llm: false
+    every: 1
+    weight: 1.0
+
+  news:
+    name: محلل الأخبار
+    role: يقرأ العناوين ويقيّم أثرها على كل سهم
+    enabled: true
+    use_llm: true
+    model: claude-opus-5-5
+    effort: low
+    every: 2
+    weight: 1.0
+    prompt: |
+      أنت محلل أخبار مالية. لكل سهم، قيّم أثر العناوين على السعر في الساعات القادمة.
+      score من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، و confidence من 0 إلى 1.
+      تجاهل العناوين القديمة أو العامة. إن لم توجد أخبار مؤثرة فأعطِ score=0.
+
+  macro:
+    name: محلل السوق العام
+    role: يحدد مزاج السوق من المؤشرات (SPY/QQQ)
+    enabled: true
+    use_llm: true
+    model: claude-opus-5-5
+    effort: low
+    every: 3
+    weight: 1.0
+    prompt: |
+      أنت محلل اقتصاد كلي. من حركة المؤشرات حدّد مزاج السوق:
+      score من -1 (هبوطي/خوف) إلى 1 (صعودي/إقبال على المخاطرة)، مع confidence وسبب قصير.
+
+  risk:
+    name: مدير المخاطر
+    role: حدود صارمة بالكود — يرفض أو يصغّر أي أمر يخالفها
+    enabled: true
+    use_llm: false
+    every: 1
+    weight: 1.0
+
+  execution:
+    name: المنفّذ
+    role: يرسل الأوامر إلى الوسيط مع وقف خسارة وجني أرباح
+    enabled: true
+    use_llm: false
+    every: 1
+    weight: 1.0
+
+  auditor:
+    name: المدقق
+    role: يقيّم صحة إشارات كل وكيل ويوزّع المكافآت (الأوزان)
+    enabled: true
+    use_llm: false
+    every: 1
+    weight: 1.0
+    auto_reward: true
