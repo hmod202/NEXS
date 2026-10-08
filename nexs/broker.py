@@ -1,10 +1,17 @@
 """Brokers: a built-in simulator (works out of the box) and Interactive Brokers via ib_async."""
 import asyncio
+import json
 import math
 import os
 import random
 import time
+import urllib.request
 from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+from .config import ROOT, agents_cfg
+from .market import ET, is_open
 
 
 class SimBroker:
@@ -101,6 +108,165 @@ class SimBroker:
             self.cash += p["qty"] * px
             self.exits.append({"symbol": sym, "price": px, "reason": "close", "ts": time.time()})
         return {"status": "closed" if p else "no position", "price": px}
+
+    async def flatten(self) -> None:
+        for sym in list(self.pos):
+            await self.close(sym)
+
+
+def _yahoo_json(url: str) -> dict:
+    # Plain JSON instead of yfinance: Windows Smart App Control blocks pandas' DLLs, which yfinance needs.
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+class DemoBroker:
+    """Demo account on real prices: Yahoo Finance 1-minute bars, virtual cash, simulated bracket fills.
+
+    Orders and stop/target exits only fill during the regular session. Fills pay a small slippage and an
+    IBKR-like commission, and the account is saved to disk so a restart keeps cash and positions.
+    """
+
+    mode = "demo"
+    SLIPPAGE = 0.0005  # 0.05% against us on every fill
+    REFRESH_S = 20
+
+    def __init__(self, symbols: list[str], cash: float = 100_000, path: Path | None = None):
+        self.path = path or Path(os.environ.get("NEXS_DEMO_FILE", ROOT / "data" / "demo_account.json"))
+        self.symbols = list(symbols)
+        self.bars_: dict[str, list[tuple]] = {}  # sym -> [(ts, open, high, low, close)]
+        self.fetched: dict[str, float] = {}
+        self.checked: dict[str, float] = {}  # sym -> last bar time already checked for stop/target hits
+        self.news_cache: dict[str, tuple[float, list[str]]] = {}
+        self.exits: deque = deque(maxlen=500)
+        s = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        self.cash = s.get("cash", cash)
+        self.pos: dict[str, dict] = s.get("pos", {})  # sym -> {qty, avg, stop, take}
+        self.day, self.day_equity = s.get("day", ""), s.get("day_equity", self.cash)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"cash": self.cash, "pos": self.pos, "day": self.day,
+                                         "day_equity": self.day_equity}), encoding="utf-8")
+
+    @staticmethod
+    def _holidays():
+        return (agents_cfg.get().get("claude") or {}).get("holidays") or []
+
+    async def connect(self) -> None:
+        await asyncio.gather(*(self._refresh(s) for s in self.symbols))
+
+    async def ensure_connected(self) -> None:
+        pass
+
+    def _fetch(self, sym: str) -> list[tuple]:
+        d = _yahoo_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=2d&interval=1m&includePrePost=true")
+        res = d["chart"]["result"][0]
+        q = res["indicators"]["quote"][0]
+        return [(t, o, h, lo, c) for t, o, h, lo, c in zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"])
+                if None not in (o, h, lo, c)]
+
+    async def _refresh(self, sym: str) -> None:
+        if time.time() - self.fetched.get(sym, 0) < self.REFRESH_S:
+            return
+        self.bars_[sym] = await asyncio.to_thread(self._fetch, sym)
+        self.fetched[sym] = time.time()
+        self._check_exits(sym)
+
+    def _check_exits(self, sym: str) -> None:
+        """Walk the new 1-minute bars: a stop or target inside a bar's range fills there (stop first if both)."""
+        p, bars = self.pos.get(sym), self.bars_.get(sym) or []
+        if not p:
+            return
+        holidays = self._holidays()
+        for t, o, h, lo, c in bars:
+            if t <= self.checked.get(sym, p.get("opened", 0)) or not is_open(t, holidays):
+                continue
+            long = p["qty"] > 0
+            stop_hit = lo <= p["stop"] if long else h >= p["stop"]
+            take_hit = h >= p["take"] if long else lo <= p["take"]
+            if stop_hit or take_hit:
+                level = p["stop"] if stop_hit else p["take"]
+                # a gap through the level fills at the bar's open, not at the level
+                px = min(o, level) if (long and stop_hit) or (not long and take_hit) else max(o, level)
+                self._fill_exit(sym, px, "stop" if stop_hit else "take", t)
+                break
+        self.checked[sym] = bars[-1][0] if bars else time.time()
+
+    def _fill_exit(self, sym: str, px: float, reason: str, ts: float) -> None:
+        p = self.pos.pop(sym)
+        self.cash += p["qty"] * px - self._commission(p["qty"])
+        self.exits.append({"symbol": sym, "price": px, "reason": reason, "ts": ts})
+        self._save()
+
+    @staticmethod
+    def _commission(qty: float) -> float:
+        return max(1.0, 0.005 * abs(qty))
+
+    def _last(self, sym: str) -> float:
+        bars = self.bars_.get(sym)
+        return bars[-1][4] if bars else float("nan")
+
+    async def price(self, sym: str) -> float:
+        await self._refresh(sym)
+        return self._last(sym)
+
+    async def bars(self, sym: str, n: int = 60) -> list[float]:
+        await self._refresh(sym)
+        return [b[4] for b in self.bars_.get(sym, [])][-n:]
+
+    async def headlines(self, sym: str) -> list[str]:
+        hit = self.news_cache.get(sym)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1]
+        try:
+            d = await asyncio.to_thread(_yahoo_json,
+                                        f"https://query1.finance.yahoo.com/v1/finance/search?q={sym}&newsCount=6&quotesCount=0")
+            heads = [n["title"] for n in d.get("news", []) if n.get("title")]
+        except Exception:
+            heads = hit[1] if hit else []
+        self.news_cache[sym] = (time.time(), heads)
+        return heads
+
+    def positions(self) -> dict[str, dict]:
+        return {s: {"qty": p["qty"], "avg": p["avg"]} for s, p in self.pos.items()}
+
+    async def account(self) -> dict:
+        equity = self.cash + sum(p["qty"] * (self._last(s) if s in self.bars_ else p["avg"]) for s, p in self.pos.items())
+        today = datetime.now(ET).date().isoformat()
+        if self.day != today:  # first look of a new trading day: today's P&L starts from here
+            self.day, self.day_equity = today, equity
+            self._save()
+        return {"equity": equity, "daily_pnl": equity - self.day_equity}
+
+    async def bracket(self, sym: str, side: str, qty: float, price: float, stop: float, take: float) -> dict:
+        if not is_open(None, self._holidays()):
+            return {"status": "rejected: market closed", "price": price}
+        await self._refresh(sym)
+        px = self._last(sym) * (1 + self.SLIPPAGE if side == "buy" else 1 - self.SLIPPAGE)
+        signed = qty if side == "buy" else -qty
+        self.cash -= signed * px + self._commission(qty)
+        p = self.pos.get(sym)
+        if p:
+            total = p["qty"] + signed
+            p.update(avg=(p["avg"] * p["qty"] + px * signed) / total, qty=total, stop=stop, take=take)
+        else:
+            self.pos[sym] = {"qty": signed, "avg": px, "stop": stop, "take": take, "opened": time.time()}
+        self.checked[sym] = time.time()  # only bars after the entry can hit the stop or target
+        self._save()
+        return {"status": "filled", "price": px}
+
+    async def close(self, sym: str) -> dict:
+        if sym not in self.pos:
+            return {"status": "no position", "price": None}
+        if not is_open(None, self._holidays()):
+            return {"status": "rejected: market closed", "price": None}
+        await self._refresh(sym)
+        long = self.pos[sym]["qty"] > 0
+        px = self._last(sym) * (1 - self.SLIPPAGE if long else 1 + self.SLIPPAGE)
+        self._fill_exit(sym, px, "close", time.time())
+        return {"status": "closed", "price": px}
 
     async def flatten(self) -> None:
         for sym in list(self.pos):
@@ -220,4 +386,6 @@ def make_broker(symbols: list[str]):
             int(os.environ.get("IBKR_PORT", "4002")),  # 4002 = IB Gateway paper, 7497 = TWS paper
             int(os.environ.get("IBKR_CLIENT_ID", "17")),
         )
+    if kind == "demo":
+        return DemoBroker(symbols)
     return SimBroker(symbols, seed=int(time.time()))

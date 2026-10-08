@@ -384,3 +384,30 @@ def test_stop_and_target_exits_are_booked_as_losses_and_wins(tmp_path):
     assert by["AAPL"]["reason"] == "take" and by["AAPL"]["pnl"] == pytest.approx(25.0)
     assert by["MSFT"]["reason"] == "stop" and by["MSFT"]["pnl"] == pytest.approx(-15.0)
     assert s["net"] == pytest.approx(10.0) and s["profit_factor"] == pytest.approx(25 / 15, abs=0.01)
+
+
+# ---------- demo broker: real prices, virtual money ----------
+def test_demo_broker_fills_in_session_hits_stop_in_bar_and_persists(tmp_path, monkeypatch):
+    from nexs import broker as br
+
+    t0 = 1_800_000_000.0
+    bars = [(t0 + 60 * i, 100.0, 100.2, 99.8, 100.0) for i in range(5)]
+    monkeypatch.setattr(br.DemoBroker, "_fetch", lambda self, sym: list(bars))
+    monkeypatch.setattr(br, "is_open", lambda ts=None, holidays=(): False)
+    b = br.DemoBroker(["AAPL"], path=tmp_path / "demo.json")
+    r = run(b.bracket("AAPL", "buy", 10, 100.0, 99.0, 102.0))
+    assert r["status"].startswith("rejected") and b.pos == {}  # market closed: no fill
+
+    monkeypatch.setattr(br, "is_open", lambda ts=None, holidays=(): True)
+    r = run(b.bracket("AAPL", "buy", 10, 100.0, 99.0, 102.0))
+    assert r["status"] == "filled" and r["price"] == pytest.approx(100.05)  # 0.05% slippage
+    assert b.cash == pytest.approx(100_000 - 1000.5 - 1.0)  # cost + $1 minimum commission
+
+    b.checked["AAPL"] = t0 + 240
+    bars.append((t0 + 300, 99.5, 99.6, 98.7, 98.9))  # this minute trades through the 99.00 stop
+    b.fetched["AAPL"] = 0
+    run(b.bars("AAPL"))
+    assert b.pos == {} and b.exits[-1]["reason"] == "stop" and b.exits[-1]["price"] == 99.0
+
+    again = br.DemoBroker(["AAPL"], path=tmp_path / "demo.json")  # a restart keeps the account
+    assert again.cash == pytest.approx(b.cash) and again.pos == {}

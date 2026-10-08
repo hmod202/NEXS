@@ -29,7 +29,7 @@
   .stat small { color: var(--muted); font-size: 12px; }
   .stat b { font-weight: 500; }
   .chip { padding: 2px 10px; border-radius: 999px; border: 1px solid currentColor; font-size: 13px; }
-  .chip.sim { color: var(--teal); } .chip.paper { color: var(--brass); } .chip.live { color: var(--down); }
+  .chip.sim { color: var(--teal); } .chip.paper, .chip.demo { color: var(--brass); } .chip.live { color: var(--down); }
   .spacer { flex: 1; }
   #halt { background: var(--down); border-color: var(--down); color: #fff; font-weight: 600; }
   #halt.resume { background: var(--up); border-color: var(--up); }
@@ -384,7 +384,7 @@ function addMsg(m, animate = true) {
 
 /* ---------- state rendering ---------- */
 function render() {
-  const modes = { sim: "محاكاة", paper: "IBKR تجريبي", live: "IBKR حقيقي" };
+  const modes = { sim: "محاكاة (أسعار وهمية)", demo: "تجريبي · أسعار حقيقية", paper: "IBKR تجريبي", live: "IBKR حقيقي" };
   const mode = $("#mode"); mode.textContent = modes[S.mode] || S.mode; mode.className = `chip ${S.mode}`;
   $("#equity").textContent = "$" + fmt(S.account.equity);
   const pnl = S.account.daily_pnl; $("#pnl").textContent = (pnl >= 0 ? "+" : "") + fmt(pnl); $("#pnl").className = "num " + (pnl >= 0 ? "up" : "down");

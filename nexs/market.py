@@ -36,6 +36,12 @@ def llm_window(hours: dict | None, now: datetime | None = None) -> dict:
     return {"active": False, "phase": "closed", "next_start": None}
 
 
+def is_open(ts: float | None = None, holidays=()) -> bool:
+    """Regular session (9:30-16:00 New York, trading days); demo orders and stop/target fills only happen inside it."""
+    now = datetime.fromtimestamp(ts, ET) if ts else datetime.now(ET)
+    return _trading_day(now.date(), {str(h) for h in holidays}) and OPEN <= now.time() < CLOSE
+
+
 def et_day_start(now: datetime | None = None) -> float:
     """Unix time of midnight New York time today; the cost counter's day and budget follow the trading day."""
     now = (now or datetime.now(ET)).astimezone(ET)

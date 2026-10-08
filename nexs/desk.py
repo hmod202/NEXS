@@ -544,7 +544,7 @@ class Desk:
                                  json.dumps(o)))
             self.bus.db.commit()
             fills.append({**o, "status": status, "fill_price": res.get("price")})
-            if o["action"] in ("buy", "sell") and not status.startswith("error") and status not in ("Cancelled", "Inactive"):
+            if o["action"] in ("buy", "sell") and status.lower() in ("filled", "submitted", "presubmitted", "pendingsubmit"):
                 t = self.book.get(o["symbol"])
                 px = res.get("price") or o["price"]
                 if t and t["side"] == o["action"]:  # adding to the same side: average the entry
