@@ -551,7 +551,9 @@ class Desk:
                     t["entry"] = (t["entry"] * t["qty"] + px * o["qty"]) / (t["qty"] + o["qty"])
                     t["qty"] += o["qty"]
                 else:
-                    self.book[o["symbol"]] = {"side": o["action"], "qty": o["qty"], "entry": px, "ts": time.time()}
+                    # An IBKR order may still be working ("Submitted"): it only counts once a position shows up.
+                    self.book[o["symbol"]] = {"side": o["action"], "qty": o["qty"], "entry": px, "ts": time.time(),
+                                              "seen": status.lower() == "filled"}
         self._settle()
         return fills
 
@@ -566,6 +568,11 @@ class Desk:
         positions = self.broker.positions()
         for sym, t in list(self.book.items()):
             if sym in positions and sym not in exits:
+                t["seen"] = True
+                continue
+            if not t.get("seen", True) and sym not in exits:
+                if time.time() - t["ts"] > 86400:  # never filled (cancelled or expired): drop it, nothing to book
+                    del self.book[sym]
                 continue
             # the broker's own exit fill when it reports one (simulator); otherwise the last price we saw
             e = exits.get(sym) or {"price": self.closes.get(sym, [t["entry"]])[-1], "reason": "closed", "ts": time.time()}
@@ -581,7 +588,7 @@ class Desk:
         for sym, p in positions.items():  # positions opened before this run (e.g. after a restart on IBKR)
             if sym not in self.book and p["qty"]:
                 self.book[sym] = {"side": "buy" if p["qty"] > 0 else "sell", "qty": abs(p["qty"]), "entry": p["avg"],
-                                  "ts": time.time()}
+                                  "ts": time.time(), "seen": True}
 
     def trade_stats(self, limit: int = 50) -> dict:
         """Win/loss summary for the current broker mode, so simulator results never mix with paper ones."""

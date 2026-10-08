@@ -411,3 +411,28 @@ def test_demo_broker_fills_in_session_hits_stop_in_bar_and_persists(tmp_path, mo
 
     again = br.DemoBroker(["AAPL"], path=tmp_path / "demo.json")  # a restart keeps the account
     assert again.cash == pytest.approx(b.cash) and again.pos == {}
+
+
+def test_working_ibkr_order_is_booked_only_after_it_fills(tmp_path):
+    class PendingIB:
+        mode = "paper"
+        pos: dict = {}
+
+        def positions(self):
+            return self.pos
+
+        async def bracket(self, *a):
+            return {"status": "Submitted", "price": 100.0}
+
+    broker = PendingIB()
+    desk = Desk(broker, Bus(tmp_path / "t.db"), NoLLM())
+    desk.closes = {"AAPL": [100.0]}
+    run(desk.execute([{"symbol": "AAPL", "action": "buy", "qty": 5, "price": 100.0, "stop": 99, "take": 102}], RISK))
+    assert desk.trade_stats()["count"] == 0  # not filled yet: no phantom closed trade
+    broker.pos = {"AAPL": {"qty": 5, "avg": 100.0}}
+    desk._settle()  # fills
+    broker.pos = {}
+    desk.closes = {"AAPL": [102.0]}
+    desk._settle()  # target hit
+    stats = desk.trade_stats()
+    assert stats["count"] == 1 and stats["wins"] == 1 and stats["net"] == 10.0
