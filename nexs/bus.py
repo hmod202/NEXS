@@ -23,6 +23,11 @@ class Bus:
                 score REAL, confidence REAL, price REAL, horizon REAL, outcome REAL, reason TEXT, lesson TEXT);
             CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, ts REAL, symbol TEXT, side TEXT,
                 qty REAL, price REAL, status TEXT, note TEXT);
+            CREATE TABLE IF NOT EXISTS llm_usage(id INTEGER PRIMARY KEY, ts REAL, agent TEXT, model TEXT,
+                input INT, output INT, cache_read INT, cache_write INT, cost REAL);
+            CREATE INDEX IF NOT EXISTS llm_usage_ts ON llm_usage(ts);
+            CREATE TABLE IF NOT EXISTS closed_trades(id INTEGER PRIMARY KEY, mode TEXT, symbol TEXT, side TEXT,
+                qty REAL, entry REAL, exit REAL, pnl REAL, pnl_pct REAL, opened REAL, closed REAL, reason TEXT);
             """
         )
         for col in ("reason", "lesson"):  # databases created before these columns existed

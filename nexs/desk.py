@@ -11,13 +11,15 @@ from pydantic import BaseModel
 
 from .bus import Bus
 from . import fundamentals as fund
+from . import market
 from .config import agents_cfg, risk_cfg
 from .indicators import clamp, pct_change, rsi, sma
-from .llm import LLM
+from .llm import LLM, current_agent
 
 log = logging.getLogger("nexs.desk")
 
-BUILTIN = {"ceo", "scanner", "technical", "news", "macro", "fundamentals", "bull", "bear", "risk", "execution", "auditor"}
+BUILTIN = {"ceo", "scanner", "technical", "news", "macro", "fundamentals", "bull", "bear", "risk", "execution", "auditor",
+           "tradingview"}
 SIGNAL_HORIZON_S = 300  # signals are graded on the price move over the next 5 minutes
 POSITIVE = ("beat", "upgrade", "launch", "record", "surge", "raises", "approval", "partnership")
 NEGATIVE = ("miss", "downgrade", "cut", "probe", "lawsuit", "recall", "plunge", "investigation", "layoff")
@@ -84,6 +86,12 @@ class Desk:
         self.account = {"equity": 0.0, "daily_pnl": 0.0}
         self.wake = asyncio.Event()
         self.debate: dict[str, dict] = {}
+        self.studied_at: dict[str, float] = {}  # symbol -> last Claude study, for the cooldown
+        self.tv_alerts: dict[str, tuple[float, Signal]] = {}  # symbol -> latest TradingView alert
+        self.book: dict[str, dict] = {}  # open trades: symbol -> {side, qty, entry, ts}; settled into closed_trades
+        self.llm.on_usage = self._record_usage
+        # Claude only runs inside this gate (market hours + daily budget); refreshed at the start of every cycle.
+        self.llm_gate = {"active": True, "phase": "always", "next_start": None}
 
     # ---------- plumbing ----------
     def send(self, src: str, dst: str, kind: str, payload) -> None:
@@ -93,10 +101,24 @@ class Desk:
         a = cfg["agents"].get(agent) or {}
         return bool(a.get("enabled")) and self.cycle % max(1, int(a.get("every", 1))) == 0
 
+    def _use_llm(self, a: dict, default: bool = False) -> bool:
+        return bool(a.get("use_llm", default)) and self.llm.available and self.llm_gate["active"]
+
+    def _update_llm_gate(self, cfg: dict) -> None:
+        c = cfg.get("claude") or {}
+        gate = market.llm_window(c)
+        budget = float(c.get("daily_budget_usd") or 0)
+        if gate["active"] and budget and self.llm_costs()["today"] >= budget:
+            gate = {"active": False, "phase": "budget", "next_start": None}
+        if gate["phase"] != self.llm_gate["phase"]:
+            log.info("Claude agents: %s", gate["phase"])
+        self.llm_gate = gate
+
     async def _step(self, agent: str, coro):
         self.state[agent] = {**self.state.get(agent, {}), "status": "running", "since": time.time()}
         self.bus.broadcast({"type": "agent", "id": agent, "status": "running"})
         t0 = time.perf_counter()
+        token = current_agent.set(agent)
         try:
             result = await coro
             status = "idle"
@@ -104,6 +126,8 @@ class Desk:
             log.exception("agent %s failed", agent)
             self.send(agent, "ceo", "error", {"error": str(e)})
             result, status = None, "error"
+        finally:
+            current_agent.reset(token)
         ms = round((time.perf_counter() - t0) * 1000)
         self.state[agent] = {"status": status, "last_ms": ms, "last_run": time.time(), "cycle": self.cycle}
         self.bus.broadcast({"type": "agent", "id": agent, "status": status, "last_ms": ms})
@@ -125,6 +149,7 @@ class Desk:
     async def run_cycle(self) -> None:
         cfg, risk = agents_cfg.get(), risk_cfg.get()
         self.cycle += 1
+        self._update_llm_gate(cfg)
         watch = list(dict.fromkeys(cfg.get("watchlist", [])))
         proxies = cfg.get("market_proxies", ["SPY"])
         symbols = list(dict.fromkeys(watch + proxies))
@@ -133,6 +158,7 @@ class Desk:
             asyncio.gather(*(self.broker.bars(s, 60) for s in symbols), return_exceptions=True), 30)
         self.closes = {s: c for s, c in zip(symbols, closes) if isinstance(c, list) and c}
         self.account = await asyncio.wait_for(self.broker.account(), 15)
+        self._settle()
         self.bus.broadcast({"type": "cycle", "cycle": self.cycle})
 
         focus = watch
@@ -140,13 +166,17 @@ class Desk:
             focus = await self._step("scanner", self.scanner(watch, cfg["agents"]["scanner"])) or watch
             for dst in ("technical", "news"):
                 self.send("scanner", dst, "focus", {"symbols": focus})
+        self._refresh_tv(cfg)
+        focus = list(dict.fromkeys(focus + [s for s in self.tv_alerts if s in watch]))  # alerted symbols always get a look
 
-        analysts = {"technical": self.technical(focus), "news": self.news(focus, cfg["agents"].get("news", {})),
-                    "macro": self.macro(proxies, cfg["agents"].get("macro", {})),
-                    "fundamentals": self.fundamentals(focus, cfg["agents"].get("fundamentals", {}))}
+        # The every-cycle scan is rules only (free). Claude is spent in study(), on trade candidates.
+        rules = lambda agent: {**cfg["agents"].get(agent, {}), "use_llm": False}
+        analysts = {"technical": self.technical(focus), "news": self.news(focus, rules("news")),
+                    "macro": self.macro(proxies, rules("macro")),
+                    "fundamentals": self.fundamentals(focus, rules("fundamentals"))}
         for agent, a in cfg["agents"].items():
             if agent not in BUILTIN:
-                analysts[agent] = self.custom(focus, a)
+                analysts[agent] = self.custom(focus, rules(agent))  # custom agents have no rules: study only
         runs = {a: c for a, c in analysts.items() if self._active(cfg, a)}
         for a, c in analysts.items():
             if a not in runs:
@@ -166,8 +196,7 @@ class Desk:
 
         if not self._active(cfg, "ceo"):
             return
-        await self.run_debate(focus, cfg)
-        decisions = await self._step("ceo", self.ceo(focus, cfg))
+        decisions = await self._step("ceo", self.decide(focus, cfg, risk))
         if not decisions:
             return
         self._record_signals("ceo", [Signal(symbol=d.symbol, score={"buy": 1, "sell": -1}[d.action],
@@ -211,7 +240,7 @@ class Desk:
         heads = {s: h for s, h in heads.items() if h}
         if not heads:
             return []  # nothing to read: skip the model call entirely
-        if a.get("use_llm") and self.llm.available:
+        if self._use_llm(a):
             res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
                                             json.dumps(heads, ensure_ascii=False), SignalList)
             if res:
@@ -230,7 +259,7 @@ class Desk:
         if not moves:
             return []
         view = None
-        if a.get("use_llm") and self.llm.available:
+        if self._use_llm(a):
             view = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
                                              json.dumps(moves), MarketView)
         if view is None:
@@ -245,7 +274,7 @@ class Desk:
         data = {s: d for s, d in zip(focus, got) if isinstance(d, dict) and d}
         if not data:
             return []
-        if a.get("use_llm") and self.llm.available and a.get("prompt"):
+        if self._use_llm(a) and a.get("prompt"):
             res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
                                             json.dumps(data, ensure_ascii=False), SignalList)
             if res:
@@ -263,7 +292,7 @@ class Desk:
         self.debate = {}
         A = cfg["agents"]
         sides = [x for x in ("bull", "bear") if self._active(cfg, x) and A[x].get("use_llm") and A[x].get("prompt")]
-        if not sides or not self.llm.available:
+        if not sides or not (self.llm.available and self.llm_gate["active"]):
             return
         weights = self._weights(cfg)
         views = {s: [{"agent": ag, "weight": round(weights.get(ag, 1), 2), **x.model_dump(exclude={"symbol"})}
@@ -301,7 +330,7 @@ class Desk:
 
     async def custom(self, focus: list[str], a: dict) -> list[Signal]:
         """Agents added from the UI: a prompt plus price stats and headlines in, graded signals out."""
-        if not (a.get("use_llm", True) and self.llm.available and a.get("prompt")):
+        if not (self._use_llm(a, default=True) and a.get("prompt")):
             return []
         data = {}
         for s in focus:
@@ -322,8 +351,75 @@ class Desk:
         mult = self.reward_multipliers() if cfg["agents"].get("auditor", {}).get("auto_reward") else {}
         return {a: float(v.get("weight", 1.0)) * mult.get(a, 1.0) for a, v in cfg["agents"].items()}
 
-    async def ceo(self, focus: list[str], cfg: dict) -> DecisionList:
-        a = cfg["agents"]["ceo"]
+    # ---------- trade studies: Claude is spent only on real trade candidates ----------
+    async def decide(self, focus: list[str], cfg: dict, risk: dict) -> DecisionList:
+        """Rules scan every symbol for free; a buy/sell candidate gets a full Claude study before any order."""
+        c = cfg.get("claude") or {}
+        rules = self._ceo_rules(self._ceo_report(focus, cfg))
+        if c.get("trade_without_study"):
+            return rules  # owner opted out of studies: the rule decision goes straight to risk
+        picks = self._study_candidates(rules, c, risk)
+        if not picks:
+            return self._hold(rules, [], "no candidate to study")
+        if not (self.llm.available and self.llm_gate["active"]):
+            why = "no API key" if not self.llm.available else f"Claude off: {self.llm_gate['phase']}"
+            return self._hold(rules, [], f"not studied ({why})")
+        if self.studies_today() >= int(c.get("max_studies_per_day", 10)):
+            return self._hold(rules, [], "daily study limit reached")
+        return self._hold(await self.study(picks, cfg), picks, "")
+
+    def _study_candidates(self, rules: DecisionList, c: dict, risk: dict) -> list[str]:
+        if self.halted or not risk.get("trading_enabled", False):
+            return []  # nothing could be executed, so a study would be wasted money
+        positions, now = self.broker.positions(), time.time()
+        cool = 60 * float(c.get("study_cooldown_minutes", 30))
+        out = []
+        for d in rules.decisions:
+            qty = positions.get(d.symbol, {"qty": 0})["qty"]
+            if d.action == "hold" or now - self.studied_at.get(d.symbol, 0) < cool:
+                continue
+            if (d.action == "buy" and qty > 0) or (d.action == "sell" and qty <= 0 and not risk.get("allow_short")):
+                continue  # already long, or a short the risk manager would refuse anyway
+            out.append(d)
+        out.sort(key=lambda d: -d.confidence)
+        return [d.symbol for d in out[: int(c.get("max_symbols_per_study", 2))]]
+
+    @staticmethod
+    def _hold(res: DecisionList, keep: list[str], note: str) -> DecisionList:
+        """Only decisions for `keep` may act; every other buy/sell becomes hold."""
+        out = [d if d.symbol in keep or d.action == "hold" else
+               d.model_copy(update={"action": "hold", "reason": f"{d.reason}; {note}"}) for d in res.decisions]
+        acted = [d for d in out if d.action != "hold"]
+        summary = res.summary if keep else (f"{len(res.decisions) - len(acted)} hold" + (f" ({note})" if note else ""))
+        return DecisionList(decisions=out, summary=summary)
+
+    def studies_today(self) -> int:
+        return self.bus.db.execute("SELECT COUNT(*) FROM messages WHERE kind='study' AND ts>=?",
+                                   (market.et_day_start(),)).fetchone()[0]
+
+    async def study(self, picks: list[str], cfg: dict) -> DecisionList:
+        """News, fundamentals and custom analysts read the candidates with Claude, bull and bear argue, the CEO decides."""
+        A, c = cfg["agents"], cfg.get("claude") or {}
+        self.send("ceo", "ceo", "study", {"symbols": picks, "n": self.studies_today() + 1,
+                                          "max": int(c.get("max_studies_per_day", 10))})
+        for s in picks:
+            self.studied_at[s] = time.time()
+        jobs = {"news": self.news(picks, A.get("news", {})), "fundamentals": self.fundamentals(picks, A.get("fundamentals", {}))}
+        jobs.update({ag: self.custom(picks, a) for ag, a in A.items() if ag not in BUILTIN})
+        for ag in [ag for ag in jobs if not (A.get(ag) or {}).get("enabled")]:
+            jobs.pop(ag).close()
+        results = await asyncio.gather(*(self._step(ag, j) for ag, j in jobs.items()))
+        for ag, sigs in zip(jobs, results):
+            if not sigs:
+                continue
+            others = [x for x in self.last_signals.get(ag, {}).get("signals", []) if x.symbol not in picks]
+            self.last_signals[ag] = {"ts": time.time(), "signals": others + sigs}
+            self._record_signals(ag, sigs)
+            self.send(ag, "ceo", "signals", [s.model_dump() for s in sigs])
+        await self.run_debate(picks, cfg)
+        return await self.ceo(picks, cfg)
+
+    def _ceo_report(self, focus: list[str], cfg: dict) -> dict:
         weights = self._weights(cfg)
         now = time.time()
         positions = self.broker.positions()
@@ -349,7 +445,12 @@ class Desk:
             }
             if s in self.debate:
                 report["symbols"][s]["debate"] = self.debate[s]
-        if a.get("use_llm") and self.llm.available:
+        return report
+
+    async def ceo(self, focus: list[str], cfg: dict) -> DecisionList:
+        a = cfg["agents"]["ceo"]
+        report = self._ceo_report(focus, cfg)
+        if self._use_llm(a):
             res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "medium"), a["prompt"],
                                             json.dumps(report, ensure_ascii=False), DecisionList)
             if res:
@@ -424,6 +525,7 @@ class Desk:
         return approved
 
     async def execute(self, orders: list[dict], risk: dict) -> list[dict]:
+        self._settle()  # book any stop/target exits before a new entry on the same symbol
         fills = []
         for o in orders:
             if self.halted:  # kill switch pressed mid-cycle
@@ -442,7 +544,62 @@ class Desk:
                                  json.dumps(o)))
             self.bus.db.commit()
             fills.append({**o, "status": status, "fill_price": res.get("price")})
+            if o["action"] in ("buy", "sell") and not status.startswith("error") and status not in ("Cancelled", "Inactive"):
+                t = self.book.get(o["symbol"])
+                px = res.get("price") or o["price"]
+                if t and t["side"] == o["action"]:  # adding to the same side: average the entry
+                    t["entry"] = (t["entry"] * t["qty"] + px * o["qty"]) / (t["qty"] + o["qty"])
+                    t["qty"] += o["qty"]
+                else:
+                    self.book[o["symbol"]] = {"side": o["action"], "qty": o["qty"], "entry": px, "ts": time.time()}
+        self._settle()
         return fills
+
+    # ---------- closed trades: wins and losses ----------
+    def _settle(self) -> None:
+        """Move trades whose position is gone (stop, target, close, flatten) into closed_trades with their P&L."""
+        exits = {}
+        log_ = getattr(self.broker, "exits", None)
+        while log_:
+            e = log_.popleft()
+            exits[e["symbol"]] = e
+        positions = self.broker.positions()
+        for sym, t in list(self.book.items()):
+            if sym in positions and sym not in exits:
+                continue
+            # the broker's own exit fill when it reports one (simulator); otherwise the last price we saw
+            e = exits.get(sym) or {"price": self.closes.get(sym, [t["entry"]])[-1], "reason": "closed", "ts": time.time()}
+            sign = 1 if t["side"] == "buy" else -1
+            pnl = sign * (e["price"] - t["entry"]) * t["qty"]
+            self.bus.db.execute(
+                "INSERT INTO closed_trades(mode,symbol,side,qty,entry,exit,pnl,pnl_pct,opened,closed,reason) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (self.broker.mode, sym, t["side"], t["qty"], t["entry"], e["price"], pnl,
+                 pnl / (t["entry"] * t["qty"]) * 100 if t["entry"] else 0, t["ts"], e["ts"], e["reason"]))
+            del self.book[sym]
+        self.bus.db.commit()
+        for sym, p in positions.items():  # positions opened before this run (e.g. after a restart on IBKR)
+            if sym not in self.book and p["qty"]:
+                self.book[sym] = {"side": "buy" if p["qty"] > 0 else "sell", "qty": abs(p["qty"]), "entry": p["avg"],
+                                  "ts": time.time()}
+
+    def trade_stats(self, limit: int = 50) -> dict:
+        """Win/loss summary for the current broker mode, so simulator results never mix with paper ones."""
+        rows = self.bus.db.execute(
+            "SELECT symbol,side,qty,entry,exit,pnl,pnl_pct,opened,closed,reason FROM closed_trades WHERE mode=? "
+            "ORDER BY id DESC", (self.broker.mode,)).fetchall()
+        wins = [r[5] for r in rows if r[5] > 0]
+        losses = [r[5] for r in rows if r[5] <= 0]
+        keys = ("symbol", "side", "qty", "entry", "exit", "pnl", "pnl_pct", "opened", "closed", "reason")
+        return {
+            "count": len(rows), "wins": len(wins), "losses": len(losses),
+            "win_rate": round(len(wins) / len(rows), 3) if rows else None,
+            "net": round(sum(wins) + sum(losses), 2),
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "profit_factor": round(sum(wins) / -sum(losses), 2) if losses and sum(losses) < 0 else None,
+            "recent": [dict(zip(keys, r)) for r in rows[:limit]],
+        }
 
     # ---------- auditor: scoring & rewards ----------
     def _record_signals(self, agent: str, sigs: list[Signal]) -> None:
@@ -477,7 +634,7 @@ class Desk:
                    "move_pct": round(o / (math.copysign(1, sc) * c), 3), "minutes": round(h / 60), "reason": r}
                   for i, sym, sc, c, o, r, h in rows]
         lessons = {}
-        if a.get("use_llm") and self.llm.available and a.get("prompt"):
+        if self._use_llm(a) and a.get("prompt"):
             res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "low"), a["prompt"],
                                             json.dumps(trades, ensure_ascii=False), LessonList)
             lessons = {x.id: x.lesson for x in res.lessons} if res else {}
@@ -511,6 +668,64 @@ class Desk:
                  ROW_NUMBER() OVER (PARTITION BY agent ORDER BY id DESC) rn FROM signals WHERE outcome IS NOT NULL)
                WHERE rn<=50 GROUP BY agent""").fetchall()
         return {a: clamp(1 + 4 * avg, 0.25, 2.0) for a, n, avg in rows if n >= 10}
+
+    # ---------- TradingView alerts ----------
+    def tv_alert(self, body: dict) -> dict:
+        """A TradingView webhook alert becomes a signal; it never places an order itself (CEO + study + risk still decide)."""
+        cfg = agents_cfg.get()
+        a = cfg["agents"].get("tradingview") or {}
+        sym = str(body.get("symbol", "")).split(":")[-1].strip().upper()  # "NASDAQ:AAPL" -> "AAPL"
+        action = str(body.get("action", "")).strip().lower()
+        reason = None
+        if not a.get("enabled"):
+            reason = "tradingview agent is disabled"
+        elif action not in ("buy", "sell"):
+            reason = f"action must be buy or sell, got {action!r}"
+        elif sym not in cfg.get("watchlist", []):
+            reason = f"{sym or '?'} is not in the watchlist"
+        if reason:
+            self.send("tradingview", "ceo", "alert_ignored", {"symbol": sym, "action": action, "reason": reason})
+            return {"ok": False, "reason": reason}
+        try:
+            conf = clamp(float(body.get("confidence", a.get("confidence", 0.7))), 0, 1)
+        except (TypeError, ValueError):
+            conf = float(a.get("confidence", 0.7))
+        note = str(body.get("reason") or body.get("message") or "").strip()
+        sig = Signal(symbol=sym, score=1.0 if action == "buy" else -1.0, confidence=conf,
+                     reason=("TradingView: " + (note or action))[:300])
+        self.tv_alerts[sym] = (time.time(), sig)
+        self._refresh_tv(cfg)
+        self._record_signals("tradingview", [sig])  # graded and rewarded like every other agent
+        self.send("tradingview", "ceo", "signals", [sig.model_dump()])
+        self.wake.set()  # react now instead of waiting for the next cycle
+        return {"ok": True, "symbol": sym, "action": action}
+
+    def _refresh_tv(self, cfg: dict) -> None:
+        """Alerts are events: each stays in the CEO's view for ttl_minutes, then expires."""
+        ttl = 60 * float((cfg["agents"].get("tradingview") or {}).get("ttl_minutes", 15))
+        now = time.time()
+        self.tv_alerts = {s: (ts, sig) for s, (ts, sig) in self.tv_alerts.items() if now - ts < ttl}
+        if self.tv_alerts:
+            self.last_signals["tradingview"] = {"ts": max(ts for ts, _ in self.tv_alerts.values()),
+                                                "signals": [sig for _, sig in self.tv_alerts.values()]}
+        else:
+            self.last_signals.pop("tradingview", None)
+
+    # ---------- Claude cost ----------
+    def _record_usage(self, agent: str, model: str, inp: int, out: int, read: int, write: int, cost: float) -> None:
+        self.bus.db.execute("INSERT INTO llm_usage(ts,agent,model,input,output,cache_read,cache_write,cost) "
+                            "VALUES(?,?,?,?,?,?,?,?)", (time.time(), agent, model, inp, out, read, write, cost))
+        self.bus.db.commit()
+
+    def llm_costs(self) -> dict:
+        """Approximate Claude spend in USD for today and this month (New York time, like the trading day)."""
+        db = self.bus.db
+        by_agent = dict(db.execute("SELECT agent, SUM(cost) FROM llm_usage WHERE ts>=? GROUP BY agent",
+                                   (market.et_day_start(),)).fetchall())
+        month = db.execute("SELECT COALESCE(SUM(cost),0), COUNT(*) FROM llm_usage WHERE ts>=?",
+                           (market.et_month_start(),)).fetchone()
+        return {"today": round(sum(by_agent.values()), 4), "month": round(month[0], 4), "month_calls": month[1],
+                "today_by_agent": {a: round(v, 4) for a, v in sorted(by_agent.items(), key=lambda x: -x[1])}}
 
     # ---------- owner controls ----------
     def halt(self, reason: str) -> None:

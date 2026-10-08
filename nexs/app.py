@@ -1,11 +1,13 @@
 """Web server: dashboard, live WebSocket feed, and live-editing API for agents and risk limits."""
 import asyncio
+import hmac
+import json
 import logging
 import os
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from .broker import SimBroker, make_broker
@@ -18,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 log = logging.getLogger("nexs")
 
 EDITABLE = {"name", "role", "enabled", "use_llm", "model", "effort", "every", "weight", "prompt", "top_n", "auto_reward",
-            "horizon", "max_symbols"}
+            "horizon", "max_symbols", "ttl_minutes", "confidence"}
 RISK_KEYS = {"trading_enabled", "max_position_value", "max_total_exposure", "max_orders_per_hour", "daily_loss_limit",
              "min_confidence", "stop_loss_pct", "take_profit_pct", "allow_short"}
 
@@ -90,9 +92,11 @@ async def state():
         "halted": desk.halted, "halt_reason": desk.halt_reason,
         "account": account, "positions": desk.broker.positions(), "prices": prices,
         "agents": agents, "leaderboard": desk.leaderboard(),
-        "llm": {"status": desk.llm.status, "available": desk.llm.available, "usage": desk.llm.usage},
-        "settings": {k: cfg.get(k) for k in ("cycle_seconds", "watchlist", "market_proxies", "directives")},
+        "llm": {"status": desk.llm.status, "available": desk.llm.available, "usage": desk.llm.usage,
+                "gate": desk.llm_gate, "cost": desk.llm_costs(), "studies_today": desk.studies_today()},
+        "settings": {k: cfg.get(k) for k in ("cycle_seconds", "watchlist", "market_proxies", "directives", "claude")},
         "risk": risk_cfg.get(),
+        "closed": desk.trade_stats(),
         "trades": [dict(zip(("ts", "symbol", "side", "qty", "price", "status"), r)) for r in desk.bus.db.execute(
             "SELECT ts,symbol,side,qty,price,status FROM trades ORDER BY id DESC LIMIT 30").fetchall()],
     }
@@ -157,8 +161,19 @@ async def update_settings(patch: dict = Body(...)):
         cfg["watchlist"] = [s.strip().upper() for s in patch["watchlist"] if s.strip()]
     if "cycle_seconds" in patch:
         cfg["cycle_seconds"] = max(5, int(patch["cycle_seconds"]))
+    if isinstance(patch.get("claude"), dict):
+        c, p = cfg.setdefault("claude", {}), patch["claude"]
+        for k in ("market_only", "trade_without_study"):
+            if k in p:
+                c[k] = bool(p[k])
+        for k in ("pre_open_minutes", "post_close_minutes", "daily_budget_usd", "study_cooldown_minutes"):
+            if k in p:
+                c[k] = max(0.0, float(p[k]))
+        for k in ("max_studies_per_day", "max_symbols_per_study"):
+            if k in p:
+                c[k] = max(0, int(p[k]))
     agents_cfg.save(cfg)
-    return {k: cfg[k] for k in ("watchlist", "cycle_seconds")}
+    return {k: cfg.get(k) for k in ("watchlist", "cycle_seconds", "claude")}
 
 
 @app.post("/api/directive")
@@ -197,6 +212,21 @@ async def resume():
     return {"halted": False}
 
 
+@app.post("/webhook/tradingview")
+async def tradingview_alert(request: Request):
+    # TradingView cannot send headers, so the alert message carries the secret: {"secret": ..., "symbol", "action"}.
+    secret = os.environ.get("NEXS_TV_SECRET", "")
+    if not secret:
+        raise HTTPException(503, "set NEXS_TV_SECRET in .env to accept TradingView alerts")
+    try:
+        body = json.loads(await request.body())
+    except ValueError:
+        raise HTTPException(400, "the alert message must be JSON")
+    if not isinstance(body, dict) or not hmac.compare_digest(str(body.get("secret", "")).encode(), secret.encode()):
+        raise HTTPException(401, "bad secret")
+    return desk.tv_alert(body)
+
+
 @app.post("/api/cycle")
 async def run_now():
     desk.wake.set()
@@ -222,9 +252,27 @@ async def ws(sock: WebSocket):
 
 
 def main():
+    import socket
+
     import uvicorn
 
-    uvicorn.run(app, host=os.environ.get("NEXS_HOST", "127.0.0.1"), port=int(os.environ.get("NEXS_PORT", "8000")))
+    # NEXS_HOST may list several addresses, e.g. "127.0.0.1,100.x.y.z" to add the Tailscale IP without opening the LAN.
+    port = int(os.environ.get("NEXS_PORT", "8000"))
+    hosts = [h.strip() for h in os.environ.get("NEXS_HOST", "127.0.0.1").split(",") if h.strip()]
+    if len(hosts) == 1:
+        uvicorn.run(app, host=hosts[0], port=port)
+        return
+    socks = []
+    for h in hosts:
+        s = socket.socket(socket.AF_INET6 if ":" in h else socket.AF_INET)
+        try:
+            s.bind((h, port))
+            socks.append(s)
+            log.info("listening on http://%s:%s", h, port)
+        except OSError as e:  # e.g. Tailscale not up yet: keep serving on the other addresses
+            s.close()
+            log.warning("cannot listen on %s:%s (%s)", h, port, e)
+    uvicorn.Server(uvicorn.Config(app, port=port)).run(sockets=socks)
 
 
 if __name__ == "__main__":

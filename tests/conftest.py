@@ -10,3 +10,4 @@ os.environ["NEXS_CONFIG_DIR"] = str(_tmp / "config")
 os.environ["NEXS_DB"] = str(_tmp / "nexs.db")
 os.environ["NEXS_BROKER"] = "sim"
 os.environ.pop("NEXS_TOKEN", None)
+os.environ["ANTHROPIC_API_KEY"] = ""  # blocks the key in .env: tests must never make paid Claude calls

@@ -20,6 +20,7 @@ class SimBroker:
         self.start_equity = cash
         self.pos: dict[str, dict] = {}  # sym -> {qty, avg, stop, take}
         self.news: dict[str, list[str]] = {}
+        self.exits: deque = deque(maxlen=500)  # fills that closed a position; the desk drains them to book wins/losses
         for s in symbols:
             self._ensure(s)
         self._task = None
@@ -57,9 +58,12 @@ class SimBroker:
         for sym, p in list(self.pos.items()):  # bracket exits
             px = self.hist[sym][-1]
             long = p["qty"] > 0
-            if (long and (px <= p["stop"] or px >= p["take"])) or (not long and (px >= p["stop"] or px <= p["take"])):
+            hit_take = px >= p["take"] if long else px <= p["take"]
+            hit_stop = px <= p["stop"] if long else px >= p["stop"]
+            if hit_take or hit_stop:
                 self.cash += p["qty"] * px
                 del self.pos[sym]
+                self.exits.append({"symbol": sym, "price": px, "reason": "take" if hit_take else "stop", "ts": time.time()})
 
     async def price(self, sym: str) -> float:
         self._ensure(sym)
@@ -95,6 +99,7 @@ class SimBroker:
         px = self.hist[sym][-1]
         if p:
             self.cash += p["qty"] * px
+            self.exits.append({"symbol": sym, "price": px, "reason": "close", "ts": time.time()})
         return {"status": "closed" if p else "no position", "price": px}
 
     async def flatten(self) -> None:

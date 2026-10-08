@@ -86,6 +86,16 @@
   .form-grid input[type=checkbox] { width: auto; }
   .actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
   .saved { color: var(--up); font-size: 13px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .kpi { background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 10px; display: flex; flex-direction: column; }
+  .kpi small { color: var(--muted); font-size: 12px; }
+  .kpi b { font-weight: 500; font-size: 17px; }
+  .seg { display: flex; gap: 4px; margin-bottom: 8px; }
+  .seg button[aria-pressed="true"] { border-color: var(--brass); color: var(--brass); }
+  tr.win td:nth-child(7), tr.win td:nth-child(8) { color: var(--up); }
+  tr.loss td:nth-child(7), tr.loss td:nth-child(8) { color: var(--down); }
+  .tv-chart { height: 560px; direction: ltr; }
+  @media (max-width: 960px) { .tv-chart { height: 420px; } }
 
   dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--r-md); width: min(640px, calc(100vw - 32px)); padding: 18px; }
   dialog::backdrop { background: rgba(0,0,0,.5); }
@@ -103,6 +113,7 @@
   <div class="stat"><small>ربح/خسارة اليوم</small><b id="pnl" class="num">—</b></div>
   <div class="stat"><small>الدورة</small><b id="cycle" class="num">0</b></div>
   <div class="stat"><small>Claude</small><b id="llm">—</b></div>
+  <div class="stat"><small>تكلفة Claude التقريبية</small><b id="cost">—</b></div>
   <div class="spacer"></div>
   <button id="runnow" type="button">شغّل دورة الآن</button>
   <button id="halt" type="button">إيقاف التداول</button>
@@ -130,6 +141,7 @@
   <section class="panel tabs">
     <div class="tabbar" role="tablist">
       <button role="tab" aria-selected="true" data-tab="board">الترتيب والمكافآت</button>
+      <button role="tab" aria-selected="false" data-tab="chart">الشارت</button>
       <button role="tab" aria-selected="false" data-tab="positions">المراكز والصفقات</button>
       <button role="tab" aria-selected="false" data-tab="risk">حدود المخاطر</button>
       <button role="tab" aria-selected="false" data-tab="settings">الإعدادات والوكلاء</button>
@@ -141,6 +153,11 @@
       </table></div>
       <p style="color:var(--muted);font-size:13px">كل إشارة تُقيَّم بعد ٥ دقائق: إن تحرك السعر في اتجاهها كسب الوكيل نقاطاً. الوكيل صاحب الأداء الأفضل يحصل على وزن أعلى عند المدير التنفيذي (حتى ×٢)، والأسوأ ينخفض وزنه (حتى ×٠٫٢٥).</p>
     </div>
+    <div data-panel="chart" hidden>
+      <div class="actions" style="margin:0 0 10px"><label style="display:flex;gap:8px;align-items:center">السهم
+        <select id="chartSymbol" style="width:auto"></select></label></div>
+      <div id="tvChart" class="tv-chart"></div>
+    </div>
     <div data-panel="positions" hidden>
       <div class="table-wrap"><table>
         <thead><tr><th>السهم</th><th>الكمية</th><th>متوسط السعر</th><th>السعر الحالي</th><th>ربح/خسارة</th></tr></thead>
@@ -151,6 +168,17 @@
         <thead><tr><th>الوقت</th><th>السهم</th><th>النوع</th><th>الكمية</th><th>السعر</th><th>الحالة</th></tr></thead>
         <tbody id="trades"></tbody>
       </table></div>
+      <h2 style="margin-top:20px">الصفقات المغلقة — الرابحة والخاسرة</h2>
+      <div class="kpis" id="kpis"></div>
+      <div class="seg" role="group" aria-label="تصفية الصفقات المغلقة">
+        <button type="button" data-f="all" aria-pressed="true">الكل</button>
+        <button type="button" data-f="win" aria-pressed="false">الرابحة</button>
+        <button type="button" data-f="loss" aria-pressed="false">الخاسرة</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>أُغلقت</th><th>السهم</th><th>النوع</th><th>الكمية</th><th>الدخول</th><th>الخروج</th><th>الربح/الخسارة</th><th>٪</th><th>سبب الخروج</th><th>المدة</th></tr></thead>
+        <tbody id="closed"></tbody>
+      </table></div>
     </div>
     <div data-panel="risk" hidden>
       <form id="riskForm" class="form-grid"></form>
@@ -160,7 +188,15 @@
       <form id="settingsForm" class="form-grid">
         <label>الأسهم المراقبة (افصل بفاصلة)<input name="watchlist"></label>
         <label>مدة الدورة بالثواني<input name="cycle_seconds" type="number" min="5"></label>
+        <label class="check"><input type="checkbox" name="market_only"> Claude يعمل فقط وقت السوق الأمريكي</label>
+        <label>يبدأ قبل الافتتاح بـ (دقيقة)<input name="pre_open_minutes" type="number" min="0"></label>
+        <label>يستمر بعد الإغلاق بـ (دقيقة)<input name="post_close_minutes" type="number" min="0"></label>
+        <label>حد الصرف اليومي التقريبي ($، 0 = بلا حد)<input name="daily_budget_usd" type="number" min="0" step="any"></label>
+        <label>أقصى عدد دراسات صفقات في اليوم<input name="max_studies_per_day" type="number" min="0"></label>
+        <label>لا يعيد دراسة نفس السهم قبل (دقيقة)<input name="study_cooldown_minutes" type="number" min="0"></label>
+        <label class="check"><input type="checkbox" name="trade_without_study"> نفّذ قرارات القواعد بدون دراسة (غير موصى به)</label>
       </form>
+      <p style="color:var(--muted);font-size:13px">القواعد البرمجية تمسح الأسهم كل دورة مجاناً. Claude يُستدعى فقط عند ظهور صفقة مرشّحة لدراستها قبل التنفيذ، وخارج وقت السوق لا يُستدعى أبداً. التكلفة المعروضة تقديرية من عدد التوكنز وأسعار Anthropic المعلنة؛ الرقم الرسمي في صفحة الفوترة في console.anthropic.com.</p>
       <div class="actions"><button type="submit" form="settingsForm">احفظ الإعدادات</button><span class="saved" id="settingsSaved"></span></div>
       <h2 style="margin-top:20px">وظّف وكيلاً جديداً</h2>
       <form id="hireForm" class="form-grid">
@@ -273,8 +309,11 @@ function drawChart() {
   }
 }
 
+const GATE_OFF = { closed: "قواعد (السوق مغلق)", budget: "قواعد (وصل حد اليوم)" };
 function nodeSub(a) {
-  const brain = a.use_llm ? (S.llm.available ? "Claude" : "قواعد (لا يوجد مفتاح)") : "قواعد";
+  const g = S.llm.gate;
+  if (a.id === "tradingview") return a.status === "running" ? "يعمل الآن…" : "تنبيهات webhook";
+  const brain = !a.use_llm ? "قواعد" : !S.llm.available ? "قواعد (لا يوجد مفتاح)" : g.active ? "قواعد · Claude للصفقات" : GATE_OFF[g.phase] || "قواعد";
   const reward = a.reward_x && a.reward_x !== 1 ? ` · ×${a.reward_x}` : "";
   return a.status === "running" ? "يعمل الآن…" : brain + reward;
 }
@@ -312,7 +351,9 @@ function describe(m) {
     case "leaderboard": return p.slice(0, 4).map(r => `${name(r.agent)}: ${fmt(r.points)} نقطة (إصابة ${Math.round(r.hit_rate * 100)}٪)`).join("\n") || "لا توجد إشارات مُقيّمة بعد";
     case "directive": return "توجيه: " + p.text;
     case "debate": return p.map(a => `${a.symbol} (قوة ${fmt(a.strength)}): ${a.argument}`).join("\n");
-    case "lessons": return "دروس من صفقات سابقة:\n" + p.join("\n");
+    case "alert_ignored": return `تنبيه TradingView تم تجاهله (${p.symbol || "?"} ${p.action || ""}): ${p.reason}`;
+    case "study":return `🔍 دراسة صفقة (${p.n} من ${p.max} اليوم): ${p.symbols.join("، ")}`;
+    case "lessons":return "دروس من صفقات سابقة:\n" + p.join("\n");
     case "halt": return "⛔ توقف التداول: " + p.reason;
     case "resume": return "استُؤنف التداول";
     case "hire": return "انضم وكيل جديد: " + p.name;
@@ -348,9 +389,18 @@ function render() {
   $("#equity").textContent = "$" + fmt(S.account.equity);
   const pnl = S.account.daily_pnl; $("#pnl").textContent = (pnl >= 0 ? "+" : "") + fmt(pnl); $("#pnl").className = "num " + (pnl >= 0 ? "up" : "down");
   $("#cycle").textContent = S.cycle;
-  const u = S.llm.usage;
-  $("#llm").textContent = S.llm.available ? `${S.llm.status} · ${u.calls} طلب` : "غير متصل";
-  $("#llm").title = `input ${u.input} · cached ${u.cache_read} · output ${u.output} tokens`;
+  const u = S.llm.usage, g = S.llm.gate, c = S.llm.cost;
+  const next = g.next_start ? " — يبدأ " + new Date(g.next_start * 1000).toLocaleString("ar-u-nu-latn", { weekday: "long", hour: "numeric", minute: "2-digit" }) : "";
+  const phase = { open: "يعمل · السوق مفتوح", pre_open: "يعمل · تحضير قبل الافتتاح", always: "يعمل دائماً",
+                  closed: "قواعد · السوق مغلق" + next, budget: "قواعد · وصل حد الصرف اليومي" }[g.phase];
+  $("#llm").textContent = S.llm.available ? phase : "غير متصل (لا يوجد مفتاح)";
+  $("#llm").title = `${S.llm.status} · ${u.calls} طلب منذ التشغيل · input ${u.input} · cached ${u.cache_read} · output ${u.output} tokens`;
+  const usd = n => "$" + fmt(n, n < 1 ? 3 : 2);
+  const budget = S.settings.claude?.daily_budget_usd;
+  const maxStudies = S.settings.claude?.max_studies_per_day ?? 10;
+  $("#cost").textContent = `${usd(c.today)} اليوم${budget ? " من " + usd(budget) : ""} · ${usd(c.month)} الشهر · ${S.llm.studies_today}/${maxStudies} دراسة`;
+  $("#cost").title = "اليوم حسب الوكيل:\n" + (Object.entries(c.today_by_agent).map(([a, v]) => `${name(a)}: ${usd(v)}`).join("\n") || "لا شيء بعد")
+    + `\n\n${c.month_calls} طلب هذا الشهر · بتوقيت نيويورك`;
   const halt = $("#halt");
   halt.textContent = S.halted ? "استئناف التداول" : "إيقاف التداول"; halt.classList.toggle("resume", S.halted);
   const banner = $("#banner");
@@ -367,6 +417,7 @@ function render() {
     const tr = row([sym, p.qty, fmt(p.avg), fmt(px), fmt(pl)]); tr.lastChild.className = "num " + (pl >= 0 ? "up" : "down"); return tr;
   }));
   $("#trades").replaceChildren(...S.trades.map(t => row([new Date(t.ts * 1000).toLocaleTimeString("en-GB"), t.symbol, AR[t.side] || t.side, t.qty, fmt(t.price), t.status])));
+  renderClosed();
   $("#directives").replaceChildren(...(S.settings.directives || []).map((d, i) => {
     const li = document.createElement("li"); li.textContent = d;
     const b = document.createElement("button"); b.type = "button"; b.textContent = "×"; b.setAttribute("aria-label", "احذف التوجيه");
@@ -374,6 +425,38 @@ function render() {
   }));
   fillForms();
 }
+
+/* ---------- closed trades: wins and losses ---------- */
+let closedFilter = "all";
+const EXIT_AR = { take: "جني الأرباح", stop: "وقف الخسارة", close: "قرار المدير", closed: "أُغلقت" };
+function duration(s) { const m = Math.round(s / 60); return m < 60 ? `${m} د` : `${Math.floor(m / 60)} س ${m % 60} د`; }
+function renderClosed() {
+  const c = S.closed, signed = n => n == null ? "—" : (n > 0 ? "+" : "") + fmt(n);
+  const money = n => n == null ? "—" : (n > 0 ? "+" : n < 0 ? "-" : "") + "$" + fmt(Math.abs(n));
+  const tiles = [["الصفقات المغلقة", c.count], ["الرابحة", c.wins, "up"], ["الخاسرة", c.losses, "down"],
+    ["نسبة النجاح", c.win_rate == null ? "—" : Math.round(c.win_rate * 100) + "٪"],
+    ["صافي الربح/الخسارة", money(c.net), c.net > 0 ? "up" : c.net < 0 ? "down" : ""],
+    ["متوسط الربح", money(c.avg_win), "up"],
+    ["متوسط الخسارة", money(c.avg_loss), "down"],
+    ["معامل الربح", c.profit_factor ?? "—"]];
+  $("#kpis").replaceChildren(...tiles.map(([label, v, cls]) => {
+    const d = document.createElement("div"); d.className = "kpi";
+    const s = document.createElement("small"); s.textContent = label;
+    const b = document.createElement("b"); b.className = "num " + (cls || ""); b.textContent = v; d.append(s, b); return d;
+  }));
+  $("#kpis").title = "معامل الربح = مجموع الأرباح ÷ مجموع الخسائر (أكبر من 1 يعني النظام رابح)";
+  const rows = c.recent.filter(t => closedFilter === "all" || (closedFilter === "win" ? t.pnl > 0 : t.pnl <= 0));
+  $("#closed").replaceChildren(...(rows.length ? rows.map(t => {
+    const tr = row([new Date(t.closed * 1000).toLocaleTimeString("en-GB"), t.symbol, AR[t.side] || t.side, t.qty, fmt(t.entry), fmt(t.exit),
+                    signed(t.pnl), signed(t.pnl_pct) + "٪", EXIT_AR[t.reason] || t.reason, duration(t.closed - t.opened)], [6, 7]);
+    tr.className = t.pnl > 0 ? "win" : "loss"; return tr;
+  }) : [emptyRow(10, c.count ? "لا توجد صفقات بهذا التصنيف" : "لم تُغلق أي صفقة بعد")]));
+}
+document.querySelectorAll(".seg button").forEach(b => b.onclick = () => {
+  closedFilter = b.dataset.f;
+  document.querySelectorAll(".seg button").forEach(x => x.setAttribute("aria-pressed", x === b));
+  if (S) renderClosed();
+});
 
 function emptyRow(span, text) {
   const tr = document.createElement("tr"), td = document.createElement("td");
@@ -404,6 +487,14 @@ function fillForms() {
   }));
   $("#settingsForm").watchlist.value = S.settings.watchlist.join(", ");
   $("#settingsForm").cycle_seconds.value = S.settings.cycle_seconds;
+  const cl = S.settings.claude || {}, sf = $("#settingsForm");
+  sf.market_only.checked = cl.market_only ?? true;
+  sf.pre_open_minutes.value = cl.pre_open_minutes ?? 60;
+  sf.post_close_minutes.value = cl.post_close_minutes ?? 0;
+  sf.daily_budget_usd.value = cl.daily_budget_usd ?? 0;
+  sf.max_studies_per_day.value = cl.max_studies_per_day ?? 10;
+  sf.study_cooldown_minutes.value = cl.study_cooldown_minutes ?? 30;
+  sf.trade_without_study.checked = !!cl.trade_without_study;
 }
 
 function flash(id, text) { const el = $(id); el.textContent = text; setTimeout(() => el.textContent = "", 3000); }
@@ -450,7 +541,11 @@ $("#riskForm").onsubmit = e => {
 };
 $("#settingsForm").onsubmit = e => {
   e.preventDefault(); const f = e.target;
-  api("/api/settings", "PUT", { watchlist: f.watchlist.value.split(","), cycle_seconds: +f.cycle_seconds.value })
+  api("/api/settings", "PUT", { watchlist: f.watchlist.value.split(","), cycle_seconds: +f.cycle_seconds.value,
+    claude: { market_only: f.market_only.checked, pre_open_minutes: +f.pre_open_minutes.value,
+              post_close_minutes: +f.post_close_minutes.value, daily_budget_usd: +f.daily_budget_usd.value,
+              max_studies_per_day: +f.max_studies_per_day.value, study_cooldown_minutes: +f.study_cooldown_minutes.value,
+              trade_without_study: f.trade_without_study.checked } })
     .then(() => { flash("#settingsSaved", "تم الحفظ"); refresh(); }).catch(alert);
 };
 $("#hireForm").onsubmit = e => {
@@ -461,7 +556,30 @@ $("#hireForm").onsubmit = e => {
 document.querySelectorAll(".tabbar button").forEach(b => b.onclick = () => {
   document.querySelectorAll(".tabbar button").forEach(x => x.setAttribute("aria-selected", x === b));
   document.querySelectorAll("[data-panel]").forEach(p => p.hidden = p.dataset.panel !== b.dataset.tab);
+  if (b.dataset.tab === "chart") openChart();
 });
+
+/* ---------- TradingView chart (free embed widget; loaded only when the tab is opened) ---------- */
+let chartShown = "";
+function openChart(symbol) {
+  const sel = $("#chartSymbol");
+  const syms = [...new Set([...(S?.settings.watchlist || []), ...(S?.settings.market_proxies || [])])];
+  if (sel.options.length !== syms.length) {
+    const keep = sel.value;
+    sel.replaceChildren(...syms.map(s => new Option(s, s)));
+    if (syms.includes(keep)) sel.value = keep;
+  }
+  symbol = symbol || sel.value || syms[0];
+  if (!symbol || symbol === chartShown) return;
+  chartShown = symbol; sel.value = symbol;
+  const box = $("#tvChart"), inner = document.createElement("div"), s = document.createElement("script");
+  inner.className = "tradingview-widget-container__widget"; inner.style.height = "100%";
+  s.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js"; s.async = true;
+  s.textContent = JSON.stringify({ autosize: true, symbol, interval: "5", timezone: "America/New_York", theme: "dark",
+    style: "1", locale: "ar_AE", allow_symbol_change: true, hide_side_toolbar: false, support_host: "https://www.tradingview.com" });
+  box.replaceChildren(inner, s); box.className = "tv-chart tradingview-widget-container";
+}
+$("#chartSymbol").onchange = e => openChart(e.target.value);
 
 function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws${location.search}`);

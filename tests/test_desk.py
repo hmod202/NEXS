@@ -126,7 +126,8 @@ def test_llm_returns_parsed_output_and_tracks_usage():
     assert run(llm.structured("claude-opus-5-5", "low", "sys", "u", Signal)) == parsed
     assert msgs.kwargs["fallbacks"] == "default" and msgs.kwargs["output_config"] == {"effort": "low"}
     assert msgs.kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
-    assert llm.usage == {"input": 10, "output": 5, "cache_read": 3, "calls": 1}
+    assert {k: llm.usage[k] for k in ("input", "output", "cache_read", "calls")} == {"input": 10, "output": 5, "cache_read": 3, "calls": 1}
+    assert llm.usage["cost_usd"] == pytest.approx((10 * 4 + 5 * 20 + 3 * 0.2) / 1e6)  # Opus 5.5 list prices
 
 
 def test_llm_haiku_omits_effort_and_fallbacks():
@@ -253,3 +254,133 @@ def test_fundamentals_survives_data_outage(tmp_path, monkeypatch):
     monkeypatch.setattr(fund, "fetch", boom)
     desk, _ = make_desk(tmp_path)
     assert run(desk.fundamentals(["AAPL"], {"use_llm": False})) == []
+
+
+# ---------- Claude only during US market hours, with a cost counter ----------
+def test_llm_window_follows_new_york_session():
+    from datetime import datetime
+    from nexs.market import ET, llm_window
+
+    h = {"pre_open_minutes": 60, "holidays": ["2026-11-26"]}
+    at = lambda *a: datetime(*a, tzinfo=ET)
+    assert llm_window(h, at(2026, 10, 8, 9, 0))["phase"] == "pre_open"  # Thursday, 30 min before the open
+    assert llm_window(h, at(2026, 10, 8, 12, 0)) == {"active": True, "phase": "open", "next_start": None}
+    after = llm_window(h, at(2026, 10, 8, 16, 30))
+    assert not after["active"] and after["next_start"] == at(2026, 10, 9, 8, 30).timestamp()
+    assert llm_window(h, at(2026, 10, 10, 12, 0))["next_start"] == at(2026, 10, 12, 8, 30).timestamp()  # weekend
+    assert llm_window(h, at(2026, 11, 25, 17, 0))["next_start"] == at(2026, 11, 27, 8, 30).timestamp()  # Thanksgiving
+    assert llm_window({"market_only": False}, at(2026, 10, 10, 3, 0))["active"]
+
+
+def test_closed_market_runs_ceo_on_rules_without_calling_claude(tmp_path):
+    from nexs.config import agents_cfg
+
+    desk, _ = make_desk(tmp_path)
+    desk.llm = StubLLM({})
+    desk.llm_gate = {"active": False, "phase": "closed", "next_start": None}
+    res = run(desk.ceo(["AAPL"], agents_cfg.get()))
+    assert desk.llm.calls == [] and res.decisions and "(rules)" in res.decisions[0].reason
+
+
+def test_claude_cost_is_recorded_per_agent_and_daily_budget_stops_it(tmp_path):
+    parsed = Signal(symbol="AAPL", score=0.5, confidence=0.7, reason="r")
+    llm, _ = fake_llm(SimpleNamespace(stop_reason="end_turn", parsed_output=parsed, model="claude-sonnet-5-5",
+                                      usage=SimpleNamespace(input_tokens=1_000_000, output_tokens=0,
+                                                            cache_read_input_tokens=0, cache_creation_input_tokens=0)))
+    desk = Desk(SimBroker(["AAPL"], seed=1), Bus(tmp_path / "c.db"), llm)
+    run(desk._step("news", llm.structured("claude-opus-5-5", "low", "s", "u", Signal)))
+    cost = desk.llm_costs()
+    assert cost["today"] == cost["month"] == 2.0  # billed at the model that served it (Sonnet 5.5, $2/M input)
+    assert cost["today_by_agent"] == {"news": 2.0}
+    desk._update_llm_gate({"claude": {"market_only": False, "daily_budget_usd": 2}})
+    assert desk.llm_gate["phase"] == "budget" and not desk._use_llm({"use_llm": True})
+    desk._update_llm_gate({"claude": {"market_only": False, "daily_budget_usd": 0}})
+    assert desk._use_llm({"use_llm": True})
+
+
+# ---------- Claude studies only real trade candidates ----------
+def _study_desk(tmp_path, monkeypatch):
+    from nexs import fundamentals as fund
+    from nexs.desk import DecisionList
+
+    monkeypatch.setattr(fund, "fetch", lambda s: {})
+    desk, broker = make_desk(tmp_path)
+
+    async def no_headlines(s):
+        return []
+
+    broker.headlines = no_headlines
+    desk.llm = StubLLM({"DecisionList": DecisionList(decisions=[Decision(symbol="AAPL", action="buy", qty=5,
+                                                                         confidence=0.9, reason="studied")],
+                                                     summary="buy AAPL"),
+                        "ArgumentList": None})
+    desk.last_signals["technical"] = {"ts": time.time(), "signals": [Signal(symbol="AAPL", score=1, confidence=1, reason="up")]}
+    return desk
+
+
+CFG_STUDY = {"market_only": False, "max_studies_per_day": 10, "study_cooldown_minutes": 30}
+
+
+def test_trade_candidate_is_studied_once_then_cools_down(tmp_path, monkeypatch):
+    from nexs.config import agents_cfg
+
+    desk = _study_desk(tmp_path, monkeypatch)
+    cfg = {**agents_cfg.get(), "claude": CFG_STUDY}
+    res = run(desk.decide(["AAPL", "SPY"], cfg, RISK))
+    [buy] = [d for d in res.decisions if d.action != "hold"]
+    assert buy.reason == "studied" and desk.studies_today() == 1
+    assert [s for s, _, _ in desk.llm.calls].count("DecisionList") == 1
+    n = len(desk.llm.calls)
+    res = run(desk.decide(["AAPL", "SPY"], cfg, RISK))  # same signal a cycle later: cooldown, no new spend
+    assert len(desk.llm.calls) == n and all(d.action == "hold" for d in res.decisions)
+
+
+def test_no_trade_without_study(tmp_path, monkeypatch):
+    from nexs.config import agents_cfg
+
+    desk = _study_desk(tmp_path, monkeypatch)
+    cfg = {**agents_cfg.get(), "claude": CFG_STUDY}
+    desk.llm_gate = {"active": False, "phase": "closed", "next_start": None}
+    res = run(desk.decide(["AAPL"], cfg, RISK))
+    assert desk.llm.calls == [] and all(d.action == "hold" for d in res.decisions)
+    assert "not studied" in res.decisions[0].reason
+    desk.llm_gate = {"active": True, "phase": "open", "next_start": None}
+    res = run(desk.decide(["AAPL"], {**cfg, "claude": {**CFG_STUDY, "max_studies_per_day": 0}}, RISK))
+    assert desk.llm.calls == [] and "daily study limit" in res.decisions[0].reason
+    res = run(desk.decide(["AAPL"], cfg, {**RISK, "trading_enabled": False}))
+    assert desk.llm.calls == []  # nothing could be executed, so no study is bought
+
+
+def test_tradingview_alert_expires(tmp_path):
+    from nexs.config import agents_cfg
+
+    desk, _ = make_desk(tmp_path)
+    assert desk.tv_alert({"symbol": "AAPL", "action": "buy"})["ok"]
+    cfg = agents_cfg.get()
+    desk.tv_alerts["AAPL"] = (time.time() - 3600, desk.tv_alerts["AAPL"][1])  # an hour old
+    desk._refresh_tv(cfg)
+    assert "tradingview" not in desk.last_signals and desk.tv_alerts == {}
+
+
+# ---------- closed trades: wins and losses ----------
+def test_stop_and_target_exits_are_booked_as_losses_and_wins(tmp_path):
+    desk, broker = make_desk(tmp_path, ("AAPL", "MSFT", "SPY"))
+    for s, px in (("AAPL", 100.0), ("MSFT", 200.0)):
+        broker.hist[s].append(px)
+        desk.closes[s] = [px]
+    orders = [{"symbol": "AAPL", "action": "buy", "qty": 10, "price": 100.0, "stop": 99.0, "take": 102.0},
+              {"symbol": "MSFT", "action": "buy", "qty": 5, "price": 200.0, "stop": 198.0, "take": 204.0}]
+    run(desk.execute(orders, RISK))
+    assert set(desk.book) == {"AAPL", "MSFT"}
+    broker.hist["AAPL"].append(102.5)  # through the target
+    broker.hist["MSFT"].append(197.0)  # through the stop
+    broker.drift = {s: 0.0 for s in broker.drift}
+    broker.rng.gauss = lambda mu, sigma: 0.0  # freeze the random walk so the next tick keeps these prices
+    broker.tick()
+    desk._settle()
+    s = desk.trade_stats()
+    assert (s["count"], s["wins"], s["losses"]) == (2, 1, 1) and desk.book == {}
+    by = {t["symbol"]: t for t in s["recent"]}
+    assert by["AAPL"]["reason"] == "take" and by["AAPL"]["pnl"] == pytest.approx(25.0)
+    assert by["MSFT"]["reason"] == "stop" and by["MSFT"]["pnl"] == pytest.approx(-15.0)
+    assert s["net"] == pytest.approx(10.0) and s["profit_factor"] == pytest.approx(25 / 15, abs=0.01)
