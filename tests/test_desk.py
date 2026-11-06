@@ -436,3 +436,27 @@ def test_working_ibkr_order_is_booked_only_after_it_fills(tmp_path):
     desk._settle()  # target hit
     stats = desk.trade_stats()
     assert stats["count"] == 1 and stats["wins"] == 1 and stats["net"] == 10.0
+
+
+def test_advisor_answers_without_llm_and_places_no_order(tmp_path):
+    desk, broker = make_desk(tmp_path)
+    for _ in range(40):  # the simulator starts with one bar; give it history
+        broker.tick()
+    desk.closes = {s: list(broker.hist[s]) for s in ("AAPL", "SPY")}
+    out = run(desk.advise("aapl"))
+    assert out["symbol"] == "AAPL" and out["action"] in ("buy", "sell", "hold") and out["source"] == "rules"
+    assert 0 <= out["confidence"] <= 1
+    assert not broker.positions() and desk.bus.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+    if out["action"] != "hold":
+        assert out["stop"] and out["target"]
+        assert desk.bus.db.execute("SELECT COUNT(*) FROM signals WHERE agent='advisor'").fetchone()[0] == 1
+
+
+def test_advisor_rejects_symbol_without_data(tmp_path):
+    desk, broker = make_desk(tmp_path)
+
+    async def none(sym, n=60):
+        return []
+    broker.bars = none
+    with pytest.raises(ValueError):
+        run(desk.advise("ZZZZ"))

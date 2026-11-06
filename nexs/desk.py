@@ -74,6 +74,16 @@ class DecisionList(BaseModel):
     summary: str
 
 
+class Advice(BaseModel):
+    action: Literal["buy", "sell", "hold"]
+    confidence: float  # 0 .. 1
+    reason: str
+    entry: float | None = None
+    stop: float | None = None
+    target: float | None = None
+    risks: list[str] = []
+
+
 class Desk:
     def __init__(self, broker, bus: Bus, llm: LLM):
         self.broker, self.bus, self.llm = broker, bus, llm
@@ -217,23 +227,23 @@ class Desk:
         held = [s for s in self.broker.positions() if s in watch]  # always keep watching open positions
         return list(dict.fromkeys(held + ranked[: int(a.get("top_n", 4))]))
 
+    @staticmethod
+    def _tech_signal(s: str, c: list[float]) -> Signal | None:
+        if not c or len(c) < 31:
+            return None
+        trend = (sma(c, 10) / sma(c, 30) - 1) * 100
+        mom, r = pct_change(c, 5), rsi(c)
+        score = 0.6 * math.tanh(trend * 5) + 0.4 * math.tanh(mom * 3)
+        if r > 75:
+            score -= 0.3
+        elif r < 25:
+            score += 0.3
+        score = clamp(score)
+        return Signal(symbol=s, score=round(score, 3), confidence=round(min(1.0, 0.3 + abs(score)), 2),
+                      reason=f"trend {trend:+.2f}% mom5 {mom:+.2f}% RSI {r:.0f}")
+
     async def technical(self, focus: list[str]) -> list[Signal]:
-        out = []
-        for s in focus:
-            c = self.closes.get(s)
-            if not c or len(c) < 31:
-                continue
-            trend = (sma(c, 10) / sma(c, 30) - 1) * 100
-            mom, r = pct_change(c, 5), rsi(c)
-            score = 0.6 * math.tanh(trend * 5) + 0.4 * math.tanh(mom * 3)
-            if r > 75:
-                score -= 0.3
-            elif r < 25:
-                score += 0.3
-            score = clamp(score)
-            out.append(Signal(symbol=s, score=round(score, 3), confidence=round(min(1.0, 0.3 + abs(score)), 2),
-                              reason=f"trend {trend:+.2f}% mom5 {mom:+.2f}% RSI {r:.0f}"))
-        return out
+        return [x for x in (self._tech_signal(s, self.closes.get(s)) for s in focus) if x]
 
     async def news(self, focus: list[str], a: dict) -> list[Signal]:
         heads = dict(zip(focus, await asyncio.gather(*(self.broker.headlines(s) for s in focus))))
@@ -471,6 +481,61 @@ class Desk:
                                 reason=f"weighted score {score:+.2f} (rules)"))
         acted = [d for d in out if d.action != "hold"]
         return DecisionList(decisions=out, summary=f"{len(acted)} actions from rules" if acted else "hold all")
+
+    # ---------- advisor: the owner asks "buy or sell?" and gets an answer; it never places an order ----------
+    async def advise(self, symbol: str) -> dict:
+        symbol = symbol.strip().upper()
+        cfg = agents_cfg.get()
+        a = cfg.get("advisor") or {}
+        c = await asyncio.wait_for(self.broker.bars(symbol, 60), 30)
+        if not c or len(c) < 31:
+            raise ValueError(f"not enough price data for {symbol} yet")
+        tech = self._tech_signal(symbol, c)
+        heads, data = await asyncio.gather(self.broker.headlines(symbol),
+                                           asyncio.to_thread(fund.fetch, symbol), return_exceptions=True)
+        heads = heads if isinstance(heads, list) else []
+        data = data if isinstance(data, dict) else {}
+        weights = self._weights(cfg)
+        team = [{"agent": ag, "weight": round(weights.get(ag, 1), 2), **x.model_dump(exclude={"symbol"})}
+                for ag, v in self.last_signals.items() if ag != "advisor" for x in v["signals"] if x.symbol == symbol]
+        brief = {"symbol": symbol, "price": round(c[-1], 2), "rsi": round(rsi(c)),
+                 **{f"chg_{n}m": round(pct_change(c, n), 3) for n in (1, 5, 15, 30)},
+                 "technical": tech.model_dump(exclude={"symbol"}) if tech else None,
+                 "headlines": heads[-8:], "fundamentals": data, "team_signals": team,
+                 "market": [x.model_dump() for x in self.last_signals.get("macro", {}).get("signals", [])],
+                 "my_position": self.broker.positions().get(symbol),
+                 "owner_directives": cfg.get("directives", []), "lessons": self.lessons()}
+        res = None
+        if self.llm.available and a.get("prompt"):
+            token = current_agent.set("advisor")
+            try:
+                res = await self.llm.structured(a.get("model", "claude-opus-5-5"), a.get("effort", "medium"),
+                                                a["prompt"], json.dumps(brief, ensure_ascii=False), Advice)
+            finally:
+                current_agent.reset(token)
+        source = "claude"
+        if res is None:  # no key / API error: weighted rules over the same inputs
+            source = "rules"
+            sigs = [(1.0, tech.score, tech.confidence)] if tech else []
+            sigs += [(x["weight"], x["score"], x["confidence"]) for x in team]
+            wsum = sum(w for w, _, _ in sigs) or 1
+            score = sum(w * sc * cf for w, sc, cf in sigs) / wsum
+            res = Advice(action="buy" if score > 0.25 else "sell" if score < -0.25 else "hold",
+                         confidence=round(min(1.0, 0.4 + abs(score)), 2), reason=f"weighted score {score:+.2f} (rules)",
+                         risks=["rule-based answer: Claude unavailable"])
+        res.confidence = clamp(res.confidence, 0, 1)
+        px, risk = c[-1], risk_cfg.get()
+        if res.action != "hold":  # fill in missing levels from the desk's own stop/target percentages
+            sign = 1 if res.action == "buy" else -1
+            res.entry = res.entry or round(px, 2)
+            res.stop = res.stop or round(px * (1 - sign * risk["stop_loss_pct"] / 100), 2)
+            res.target = res.target or round(px * (1 + sign * risk["take_profit_pct"] / 100), 2)
+        if symbol in self.closes and res.action != "hold":  # graded like any agent: good advice earns trust
+            self._record_signals("advisor", [Signal(symbol=symbol, score={"buy": 1, "sell": -1}[res.action],
+                                                    confidence=res.confidence, reason=res.reason[:300])])
+        out = {**res.model_dump(), "symbol": symbol, "price": round(px, 2), "source": source}
+        self.send("advisor", "owner", "advice", out)
+        return out
 
     async def risk_check(self, decisions: list[Decision], watch: list[str], risk: dict) -> list[dict]:
         if self.account["daily_pnl"] <= -abs(risk.get("daily_loss_limit", 1e12)):

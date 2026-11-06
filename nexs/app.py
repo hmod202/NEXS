@@ -227,6 +227,17 @@ async def tradingview_alert(request: Request):
     return desk.tv_alert(body)
 
 
+@app.post("/api/advise")
+async def advise(body: dict = Body(...)):
+    symbol = re.sub(r"[^A-Za-z0-9.\-]", "", str(body.get("symbol", "")))[:10]
+    if not symbol:
+        raise HTTPException(400, "symbol is required")
+    try:
+        return await desk.advise(symbol)
+    except (ValueError, asyncio.TimeoutError) as e:
+        raise HTTPException(400, str(e) or "market data timed out")
+
+
 @app.post("/api/cycle")
 async def run_now():
     desk.wake.set()

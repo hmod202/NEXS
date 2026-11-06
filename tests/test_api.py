@@ -52,3 +52,9 @@ def test_tradingview_webhook_turns_alerts_into_signals(monkeypatch):
         assert r == {"ok": True, "symbol": "AAPL", "action": "sell"}
         [sig] = appmod.desk.last_signals["tradingview"]["signals"]
         assert (sig.symbol, sig.score, sig.confidence) == ("AAPL", -1.0, 0.9) and "RSI cross" in sig.reason
+
+
+def test_advise_endpoint_validates_symbol():
+    with TestClient(app) as c:
+        assert c.post("/api/advise", json={"symbol": "  "}).status_code == 400
+        assert c.post("/api/advise", json={"symbol": "AAPL"}).status_code in (200, 400)  # 400 while the simulator warms up

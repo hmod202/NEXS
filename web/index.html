@@ -131,6 +131,13 @@
       <button type="submit">أرسل</button>
     </form>
     <ul id="directives"></ul>
+    <h2 style="margin-top:18px">اسأل المستشار — أبيع أم أشتري؟</h2>
+    <form class="directive" id="adviseForm">
+      <input id="adviseSymbol" placeholder="رمز السهم، مثل: NVDA" aria-label="رمز السهم" list="adviseList" autocomplete="off">
+      <datalist id="adviseList"></datalist>
+      <button type="submit" id="adviseBtn">اسأل</button>
+    </form>
+    <div id="advice" aria-live="polite" style="margin-top:10px"></div>
   </section>
 
   <section class="panel">
@@ -350,6 +357,7 @@ function describe(m) {
     case "fills": return p.map(f => `${AR[f.action]} ${f.symbol}: ${f.status}`).join("\n");
     case "leaderboard": return p.slice(0, 4).map(r => `${name(r.agent)}: ${fmt(r.points)} نقطة (إصابة ${Math.round(r.hit_rate * 100)}٪)`).join("\n") || "لا توجد إشارات مُقيّمة بعد";
     case "directive": return "توجيه: " + p.text;
+    case "advice": return `${AR[p.action]} ${p.symbol} (ثقة ${fmt(p.confidence)}) — ${p.reason}`;
     case "debate": return p.map(a => `${a.symbol} (قوة ${fmt(a.strength)}): ${a.argument}`).join("\n");
     case "alert_ignored": return `تنبيه TradingView تم تجاهله (${p.symbol || "?"} ${p.action || ""}): ${p.reason}`;
     case "study":return `🔍 دراسة صفقة (${p.n} من ${p.max} اليوم): ${p.symbols.join("، ")}`;
@@ -384,6 +392,7 @@ function addMsg(m, animate = true) {
 
 /* ---------- state rendering ---------- */
 function render() {
+  fillAdviseList();
   const modes = { sim: "محاكاة (أسعار وهمية)", demo: "تجريبي · أسعار حقيقية", paper: "IBKR تجريبي", live: "IBKR حقيقي" };
   const mode = $("#mode"); mode.textContent = modes[S.mode] || S.mode; mode.className = `chip ${S.mode}`;
   $("#equity").textContent = "$" + fmt(S.account.equity);
@@ -528,6 +537,28 @@ $("#halt").onclick = () => {
   if (S.halted) return api("/api/resume", "POST").then(refresh);
   const flatten = confirm("إيقاف التداول.\nهل تريد أيضاً إغلاق كل المراكز المفتوحة الآن؟\n(موافق = إغلاق الكل، إلغاء = إيقاف الأوامر الجديدة فقط)");
   api("/api/halt", "POST", { flatten }).then(refresh);
+};
+function fillAdviseList() {
+  const dl = $("#adviseList"), w = S?.settings?.watchlist || [];
+  if (dl.children.length !== w.length) dl.replaceChildren(...w.map(x => Object.assign(document.createElement("option"), { value: x })));
+}
+function showAdvice(a) {
+  const box = $("#advice"); box.replaceChildren();
+  const add = (tag, text, css) => { const e = document.createElement(tag); e.textContent = text; if (css) e.style.cssText = css; box.append(e); };
+  const cls = a.action === "buy" ? "up" : a.action === "sell" ? "down" : "";
+  const head = document.createElement("div"); head.className = cls; head.style.cssText = "font-size:20px;font-weight:600";
+  head.textContent = `${AR[a.action]} ${a.symbol} — ثقة ${Math.round(a.confidence * 100)}٪`; box.append(head);
+  add("p", a.reason, "margin:6px 0");
+  if (a.entry) add("p", `دخول ${fmt(a.entry)} · وقف ${fmt(a.stop)} · هدف ${fmt(a.target)}`, "margin:6px 0;color:var(--muted)");
+  if (a.risks?.length) add("p", "مخاطر: " + a.risks.join("، "), "margin:6px 0;color:var(--muted);font-size:13px");
+  add("small", `السعر ${fmt(a.price)} · ${a.source === "claude" ? "تحليل Claude" : "قواعد برمجية (Claude غير متاح)"} · تحليل لا ضمان، ولا أمر يُنفَّذ من هنا`, "color:var(--muted)");
+}
+$("#adviseForm").onsubmit = e => {
+  e.preventDefault(); const sym = $("#adviseSymbol").value.trim(); if (!sym) return;
+  const btn = $("#adviseBtn"); btn.disabled = true; btn.textContent = "يحلل…";
+  api("/api/advise", "POST", { symbol: sym }).then(showAdvice)
+    .catch(err => { $("#advice").textContent = "تعذّر التحليل: " + err; })
+    .finally(() => { btn.disabled = false; btn.textContent = "اسأل"; });
 };
 $("#runnow").onclick = () => api("/api/cycle", "POST");
 $("#directiveForm").onsubmit = e => {
